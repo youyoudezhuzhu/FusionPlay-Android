@@ -783,6 +783,15 @@ pub extern "system" fn Java_com_airplayreceiver_desktop_nativebridge_FusionPlayN
             .or(interface_eui64_hardware_address.as_deref())
             .is_some_and(|address| address == active_identity.hardware_address),
     }));
+    // Explicit local marker: normal installs remain untouched. The observer
+    // writes timing fields only, on its own bounded background queue.
+    if identity_dir.join("enable-clock-observer").is_file() {
+        if let Err(error) =
+            fusionplay_miplay_sdk::clock_observer::enable(&identity_dir.join("miplay-clock.jsonl"))
+        {
+            events(json!({"event":"clock_observer_error","message":error.to_string()}));
+        }
+    }
     let config = ReceiverConfig::new(name, identity, local_ip, interface_name)
         .with_device_type(device_type)
         .with_output_device(output_device)

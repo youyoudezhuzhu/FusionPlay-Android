@@ -5,6 +5,7 @@
 //! MiPCAudio, MAFSvr, Xiaomi PC Manager, an account service, or any other
 //! vendor process. The same Rust API is available on Windows, macOS and Android.
 
+pub mod clock_observer;
 pub mod discovery;
 pub mod lyra;
 pub mod media;

@@ -1,3 +1,4 @@
+use crate::clock_observer::{Observer, Sample};
 use aes::Aes128;
 use aes::cipher::{BlockModeDecrypt, KeyIvInit, block_padding::NoPadding};
 use anyhow::{Context, Result, bail};
@@ -33,6 +34,15 @@ use symphonia::core::units::{Duration, Timestamp};
 use symphonia::default::codecs::AacDecoder;
 
 pub type EventEmitter = Arc<dyn Fn(Value) + Send + Sync + 'static>;
+
+static LEGACY_FIXED_MEDIA_COMPATIBILITY: AtomicBool = AtomicBool::new(false);
+
+/// Explicit NAS-lab compatibility for the legacy fixed-key media family.
+/// F1 PCAP: independently decoded 126/126 AAC frames with the already-known
+/// library key and the per-PES private IV. No sender or clock algorithm changes.
+pub fn enable_legacy_fixed_media_compatibility() {
+    LEGACY_FIXED_MEDIA_COMPATIBILITY.store(true, Ordering::Release);
+}
 
 const POSITION_RESUME_SETTLING_WINDOW: StdDuration = StdDuration::from_millis(1_500);
 
@@ -211,6 +221,7 @@ fn exact_ascii_key(value: &str, description: &str) -> Result<[u8; 16]> {
 /// sends a `TimeOffset` value. PES presentation timestamps plus that offset
 /// are expressed on the synchronized timer-server clock.
 struct MiPlayPresentationClock {
+    observer: Observer,
     local_epoch: Instant,
     clock_model_revision: AtomicU64,
     clock_base_local_micros: AtomicI64,
@@ -579,6 +590,7 @@ impl Drop for SessionRunFlag {
 impl MiPlayPresentationClock {
     fn new() -> Self {
         Self {
+            observer: Observer::new(),
             local_epoch: Instant::now(),
             clock_model_revision: AtomicU64::new(0),
             clock_base_local_micros: AtomicI64::new(0),
@@ -677,6 +689,12 @@ impl MiPlayPresentationClock {
     }
 
     fn set_presentation_offset(&self, offset_micros: i64) {
+        self.observer.emit(Sample {
+            event: "time_offset_received",
+            local_clock_us: Some(self.local_now_micros()),
+            time_offset_us: Some(offset_micros),
+            ..Sample::default()
+        });
         self.presentation_offset_micros
             .store(offset_micros, Ordering::Release);
         self.presentation_offset_valid
@@ -782,8 +800,36 @@ fn spawn_timer_synchronizer(
                     let Some((offset, network_rtt)) =
                         decode_timer_sample(&response, sequence, client_send, client_receive)
                     else {
+                        clock.observer.emit(Sample {
+                            event: "timer_sample",
+                            raw_timer: Some(response),
+                            sequence: Some(sequence),
+                            timer_server: Some(remote),
+                            client_send_us: Some(client_send),
+                            client_receive_us: Some(client_receive),
+                            accepted: Some(false),
+                            ..Sample::default()
+                        });
                         continue;
                     };
+                    clock.observer.emit(Sample {
+                        event: "timer_sample",
+                        raw_timer: Some(response),
+                        sequence: Some(sequence),
+                        timer_server: Some(remote),
+                        client_send_us: Some(client_send),
+                        client_receive_us: Some(client_receive),
+                        server_send_us: Some(i64::from_le_bytes(
+                            response[16..24].try_into().unwrap(),
+                        )),
+                        server_receive_us: Some(i64::from_le_bytes(
+                            response[24..32].try_into().unwrap(),
+                        )),
+                        network_rtt_us: Some(network_rtt),
+                        server_minus_local_us: Some(offset),
+                        accepted: Some(true),
+                        ..Sample::default()
+                    });
                     let local_midpoint_micros =
                         client_send.saturating_add(client_receive.saturating_sub(client_send) / 2);
                     round_samples.push(TimerSample {
@@ -801,6 +847,14 @@ fn spawn_timer_synchronizer(
                 }
                 if let Some(estimate) = estimator.observe_round(&round_samples) {
                     let applied = clock.update_server_clock(estimate);
+                    clock.observer.emit(Sample {
+                        event: "clock_model_applied",
+                        local_clock_us: Some(clock.local_now_micros()),
+                        server_minus_local_us: Some(applied.offset_micros),
+                        frequency_ppm: Some(applied.frequency_ppm),
+                        server_now_us: clock.synchronized_server_now_micros(),
+                        ..Sample::default()
+                    });
                     events(json!({
                         "event": "clock_synchronized",
                         "protocol": "xiaomi_miplay",
@@ -1049,6 +1103,22 @@ fn run_rtsp_receiver(
                 );
             }
         }
+        let observer_action = match method.as_str() {
+            "OPTIONS" => "OPTIONS",
+            "SET_PARAMETER" => "SET_PARAMETER",
+            "PLAY" => "PLAY",
+            "PAUSE" => "PAUSE",
+            "TEARDOWN" => "TEARDOWN",
+            "TIME_OFFSET" => "TIME_OFFSET",
+            _ => "other",
+        };
+        presentation_clock.observer.emit(Sample {
+            event: "rtsp_received",
+            action: Some(observer_action),
+            cseq: message.header("cseq").and_then(|v| v.parse().ok()),
+            local_clock_us: Some(presentation_clock.local_now_micros()),
+            ..Sample::default()
+        });
         match method.as_str() {
             "OPTIONS" => {
                 let response = if let Some(keys) = keys.as_ref() {
@@ -1302,7 +1372,7 @@ fn run_media_reader(
         output_device.as_deref(),
         paused,
         volume_percent,
-        presentation_clock,
+        Arc::clone(&presentation_clock),
         Arc::clone(&latency_telemetry),
         Arc::clone(&events),
     )?;
@@ -1348,6 +1418,7 @@ fn run_media_reader(
             arrival,
         );
         for packet in rtp_packet.payload.chunks_exact(188) {
+            observe_ts_pts(&presentation_clock, packet);
             for audio_pes in demuxer.push_ts_at(packet, Some(rtp_packet.timestamp_micros))? {
                 let aac = &audio_pes.payload;
                 if first_packet {
@@ -1446,6 +1517,7 @@ struct TsDemuxer {
     pes: Vec<u8>,
     pes_rtp_pts_micros: Option<i64>,
     keys: Option<StreamKeys>,
+    legacy_fixed_media: bool,
 }
 
 impl TsDemuxer {
@@ -1454,6 +1526,7 @@ impl TsDemuxer {
             pes: Vec::new(),
             pes_rtp_pts_micros: None,
             keys,
+            legacy_fixed_media: LEGACY_FIXED_MEDIA_COMPATIBILITY.load(Ordering::Acquire),
         }
     }
 
@@ -1530,6 +1603,19 @@ impl TsDemuxer {
                 payload: elementary,
                 pts_micros,
             }));
+        }
+        if self.keys.is_none()
+            && self.legacy_fixed_media
+            && let Some(iv) = pes_private_data_iv(&pes, payload_offset)
+        {
+            self.keys = Some(StreamKeys {
+                auth_key: [0; 16],
+                stream_key: [
+                    0x2b, 0x7e, 0x15, 0x16, 0x28, 0xae, 0xd2, 0xa6, 0xab, 0xf7, 0x15, 0x88, 0x09,
+                    0xcf, 0x4f, 0x3c,
+                ],
+                stream_iv: iv,
+            });
         }
         let Some(keys) = self.keys.as_mut() else {
             return Ok(Some(AudioPes {
@@ -1861,6 +1947,86 @@ fn synchronized_buffer_frames(output_latency_millis: f64) -> usize {
     let queue_latency_millis = (MIPLAY_GROUP_PLAY_DELAY_MILLIS as f64 - output_latency_millis)
         .max(MIPLAY_MINIMUM_QUEUE_DELAY_MILLIS as f64);
     (MIPLAY_SOURCE_SAMPLE_RATE as f64 * queue_latency_millis / 1_000.0).round() as usize
+}
+
+// A fresh post-decision snapshot. It is not the exact earlier decision-time
+// sample: JSONL keeps that distinction explicit instead of inventing precision.
+fn observe_queue(
+    clock: &MiPlayPresentationClock,
+    queue: &PcmQueue,
+    latency_ms: f64,
+    target: usize,
+    action: &'static str,
+    rate: Option<f64>,
+    dropped: usize,
+) {
+    if !clock.observer.enabled() {
+        return;
+    }
+    let pts = queue.front_pts_micros();
+    let offset = clock
+        .presentation_offset_valid
+        .load(Ordering::Acquire)
+        .then(|| clock.presentation_offset_micros.load(Ordering::Acquire));
+    let now = clock.synchronized_server_now_micros();
+    let target_timer = pts.zip(offset).map(|(p, o)| p + o as f64);
+    let error = target_timer
+        .zip(now)
+        .map(|(t, n)| t - (n as f64 + latency_ms * 1000.0));
+    clock.observer.callback(Sample {
+        event: "presentation_clock_sample",
+        action: Some(action),
+        local_clock_us: Some(clock.local_now_micros()),
+        media_pts_us: pts,
+        time_offset_us: offset,
+        server_now_us: now,
+        target_timer_us: target_timer,
+        output_latency_us: Some(latency_ms * 1000.0),
+        presentation_error_us: error,
+        queue_frames: Some(queue.buffered_frames()),
+        target_queue_frames: Some(target),
+        playback_rate: rate,
+        dropped_frames: Some(dropped),
+        ..Sample::default()
+    });
+}
+
+fn observe_ts_pts(clock: &MiPlayPresentationClock, ts: &[u8]) {
+    if !clock.observer.enabled() || ts.len() != 188 || ts[0] != 0x47 || ts[1] & 0x40 == 0 {
+        return;
+    }
+    let pid = (u16::from(ts[1] & 31) << 8) | u16::from(ts[2]);
+    if pid != 0x1100 {
+        return;
+    }
+    let afc = (ts[3] >> 4) & 3;
+    let off = if afc == 3 {
+        5 + usize::from(ts[4])
+    } else if afc == 1 {
+        4
+    } else {
+        return;
+    };
+    let Some(pes) = ts.get(off..) else {
+        return;
+    };
+    let ticks = if pes.len() >= 14 && pes[..3] == [0, 0, 1] && pes[7] & 0x80 != 0 {
+        let b = &pes[9..14];
+        if b[0] & 1 != 0 && b[2] & 1 != 0 && b[4] & 1 != 0 {
+            Some(
+                (u64::from((b[0] >> 1) & 7) << 30)
+                    | (u64::from(b[1]) << 22)
+                    | (u64::from(b[2] >> 1) << 15)
+                    | (u64::from(b[3]) << 7)
+                    | u64::from(b[4] >> 1),
+            )
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    clock.observer.pes(ticks);
 }
 
 fn normalized_output_latency_millis(
@@ -2431,6 +2597,10 @@ impl AudioOutputCallback for AndroidMiPlayAudioCallback {
             }));
         }
         if self.paused.load(Ordering::Acquire) {
+            self.presentation_clock.observer.callback(Sample {
+                event: "playback_gate_paused",
+                ..Sample::default()
+            });
             self.timed_playback_started = false;
             if let Ok(mut queue) = self.queue.lock() {
                 queue.clear();
@@ -2474,12 +2644,30 @@ impl AudioOutputCallback for AndroidMiPlayAudioCallback {
                     / 1_000_000.0)
                     .floor() as usize;
                 let dropped = queue.drop_frames(late_frames);
+                observe_queue(
+                    &self.presentation_clock,
+                    &queue,
+                    self.endpoint_latency_millis,
+                    synchronized_frames,
+                    "drop_late_frames",
+                    None,
+                    dropped,
+                );
                 schedule_error += dropped as f64 * 1_000_000.0 / MIPLAY_SOURCE_SAMPLE_RATE as f64;
             }
             if schedule_error > 0.0 {
                 leading_silence_frames =
                     (schedule_error * f64::from(output_sample_rate) / 1_000_000.0).ceil() as usize;
                 if leading_silence_frames >= callback_frames {
+                    observe_queue(
+                        &self.presentation_clock,
+                        &queue,
+                        self.endpoint_latency_millis,
+                        synchronized_frames,
+                        "wait_for_target",
+                        None,
+                        0,
+                    );
                     output.fill((0.0, 0.0));
                     return DataCallbackResult::Continue;
                 }
@@ -2494,6 +2682,15 @@ impl AudioOutputCallback for AndroidMiPlayAudioCallback {
         } else {
             self.timed_playback_started = false;
             if !queue.ready_to_play(synchronized_frames) {
+                observe_queue(
+                    &self.presentation_clock,
+                    &queue,
+                    self.endpoint_latency_millis,
+                    synchronized_frames,
+                    "wait_for_buffer",
+                    None,
+                    0,
+                );
                 output.fill((0.0, 0.0));
                 return DataCallbackResult::Continue;
             }
@@ -2516,6 +2713,15 @@ impl AudioOutputCallback for AndroidMiPlayAudioCallback {
                 "synchronization_mode": synchronization_mode,
             }));
         }
+        observe_queue(
+            &self.presentation_clock,
+            &queue,
+            self.endpoint_latency_millis,
+            synchronized_frames,
+            "render",
+            Some(playback_rate),
+            0,
+        );
         output[..leading_silence_frames].fill((0.0, 0.0));
         let callback_peak =
             queue.render_stereo_block(&mut output[leading_silence_frames..], playback_rate);
@@ -2768,6 +2974,10 @@ where
                 }));
             }
             if paused.load(Ordering::Acquire) {
+                presentation_clock.observer.callback(Sample {
+                    event: "playback_gate_paused",
+                    ..Sample::default()
+                });
                 timed_playback_started = false;
                 if let Ok(mut queue) = queue.try_lock() {
                     queue.clear();
@@ -2805,6 +3015,15 @@ where
                         / 1_000_000.0)
                         .floor() as usize;
                     let dropped = queue.drop_frames(late_frames);
+                    observe_queue(
+                        &presentation_clock,
+                        &queue,
+                        endpoint_latency_millis,
+                        synchronized_frames,
+                        "drop_late_frames",
+                        None,
+                        dropped,
+                    );
                     schedule_error +=
                         dropped as f64 * 1_000_000.0 / MIPLAY_SOURCE_SAMPLE_RATE as f64;
                 }
@@ -2813,6 +3032,15 @@ where
                         / 1_000_000.0)
                         .ceil() as usize;
                     if leading_silence_frames >= callback_frames {
+                        observe_queue(
+                            &presentation_clock,
+                            &queue,
+                            endpoint_latency_millis,
+                            synchronized_frames,
+                            "wait_for_target",
+                            None,
+                            0,
+                        );
                         for sample in output {
                             *sample = T::from_sample(0.0);
                         }
@@ -2824,6 +3052,15 @@ where
             } else {
                 timed_playback_started = false;
                 if !queue.ready_to_play(synchronized_frames) {
+                    observe_queue(
+                        &presentation_clock,
+                        &queue,
+                        endpoint_latency_millis,
+                        synchronized_frames,
+                        "wait_for_buffer",
+                        None,
+                        0,
+                    );
                     for sample in output {
                         *sample = T::from_sample(0.0);
                     }
@@ -2845,6 +3082,15 @@ where
                     "synchronization_mode": synchronization_mode,
                 }));
             }
+            observe_queue(
+                &presentation_clock,
+                &queue,
+                endpoint_latency_millis,
+                synchronized_frames,
+                "render",
+                Some(playback_rate),
+                0,
+            );
             let mut callback_peak = 0.0_f32;
             let gain = volume_percent.load(Ordering::Acquire).min(100) as f32 / 100.0;
             for (frame_index, frame) in output.chunks_mut(channels.max(1)).enumerate() {
@@ -3503,5 +3749,43 @@ mod tests {
         let decoded = demuxer.finish_pes().unwrap().unwrap();
         assert_eq!(decoded.payload, elementary);
         assert_eq!(decoded.pts_micros, None);
+    }
+
+    #[test]
+    fn legacy_fixed_mode_requires_private_iv_and_explicit_opt_in() {
+        // AES-CBC known-answer block; no captured user media or session keys.
+        let cipher = hex::decode("7649abac8119b246cee98e9b12e9197d").unwrap();
+        let plain = hex::decode("6bc1bee22e409f96e93d7e117393172a").unwrap();
+        for (enabled, has_iv) in [(false, true), (true, false), (true, true)] {
+            let header = if has_iv {
+                let mut h = vec![0x80];
+                h.extend(0_u8..16);
+                h
+            } else {
+                vec![]
+            };
+            let declared = 3 + header.len() + cipher.len();
+            let mut pes = vec![
+                0,
+                0,
+                1,
+                0xc0,
+                (declared >> 8) as u8,
+                declared as u8,
+                0x80,
+                if has_iv { 1 } else { 0 },
+                header.len() as u8,
+            ];
+            pes.extend(header);
+            pes.extend(&cipher);
+            let mut demuxer = TsDemuxer::new(None);
+            demuxer.legacy_fixed_media = enabled;
+            demuxer.pes = pes;
+            let decoded = demuxer.finish_pes().unwrap().unwrap();
+            assert_eq!(
+                decoded.payload,
+                if enabled && has_iv { &plain } else { &cipher }.clone()
+            );
+        }
     }
 }
