@@ -792,6 +792,19 @@ pub extern "system" fn Java_com_airplayreceiver_desktop_nativebridge_FusionPlayN
             events(json!({"event":"clock_observer_error","message":error.to_string()}));
         }
     }
+    // Android APK 默认启用 MiPlay 旧版固定密钥媒体兼容解码。
+    // 触发条件很窄：发送端未在 RTSP 宣告 0x6c 会话密钥（keys.is_none()）且 PES 带私有 IV；
+    // 正常带会话密钥的媒体完全不受影响。需要排查时可在 identity 目录放
+    // `disable-legacy-fixed-media` 标记文件关闭（与 clock observer 的 marker 同一机制）。
+    let legacy_compat = !identity_dir.join("disable-legacy-fixed-media").is_file();
+    if legacy_compat {
+        fusionplay_miplay_sdk::media::enable_legacy_fixed_media_compatibility();
+    }
+    events(json!({
+        "event": "miplay_legacy_fixed_media_compat",
+        "protocol": "xiaomi_miplay",
+        "enabled": legacy_compat,
+    }));
     let config = ReceiverConfig::new(name, identity, local_ip, interface_name)
         .with_device_type(device_type)
         .with_output_device(output_device)
