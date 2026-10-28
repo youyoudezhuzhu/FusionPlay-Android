@@ -32,7 +32,11 @@ pub struct HttpApp {
 }
 
 impl HttpApp {
-    pub fn save_config(&self, config: Config) -> Result<()> {
+    pub fn save_config(&self, mut config: Config) -> Result<()> {
+        // Any write path (config PUT, calibration PUT, import) must migrate
+        // v1 exports before validation so a legacy global curve is copied to
+        // the devices instead of being silently dropped.
+        config.migrate();
         config.validate()?;
         config.save(&self.config_path)?;
         *self.config.write().unwrap() = config;
@@ -280,7 +284,6 @@ fn handle(
                     "master_frames": engine.master_frames,
                     "dropped_frames": engine.dropped_frames,
                     "global_attenuation_percent": config.audio.global_attenuation_percent,
-                    "curve": config.audio.curve,
                     "muted": config.audio.muted,
                 },
                 "logging": {"level": logging::level_name()},
@@ -290,7 +293,8 @@ fn handle(
         }
         ("GET", "/api/config") => respond_json(&mut *respond, json!(app.snapshot())),
         ("PUT", "/api/config") => match request_json(&request).and_then(|value| {
-            let incoming: Config = serde_json::from_value(value).context("配置字段不合法")?;
+            let mut incoming: Config = serde_json::from_value(value).context("配置字段不合法")?;
+            incoming.migrate();
             incoming.validate()?;
             app.save_config(incoming.clone())?;
             app.engine.configure(incoming.audio.clone())?;
@@ -321,6 +325,16 @@ fn handle(
             }
             Err(error) => respond_error(&mut *respond, 400, &format!("{error:#}")),
         },
+        ("GET", "/api/calibration") => {
+            let config = app.snapshot();
+            respond_json(&mut *respond, json!({
+                "ok": true,
+                "config_version": config.config_version,
+                "global_attenuation_percent": config.audio.global_attenuation_percent,
+                "muted": config.audio.muted,
+                "devices": config.audio.devices,
+            }))
+        }
         ("PUT", "/api/calibration") => match request_json(&request) {
             Ok(value) => {
                 let mut config = app.snapshot();
@@ -330,30 +344,71 @@ fn handle(
                 if let Some(muted) = value.get("muted").and_then(|v| v.as_bool()) {
                     config.audio.muted = muted;
                 }
+                // Legacy v1 clients send a single global `curve`. v2 has no
+                // global curve: apply it to every device (the documented
+                // compatibility behaviour) and do not store it globally.
                 if let Some(curve) = value.get("curve") {
-                    if let Ok(parsed) = serde_json::from_value::<VolumeCurve>(curve.clone()) {
-                        config.audio.curve = parsed;
+                    match serde_json::from_value::<VolumeCurve>(curve.clone()) {
+                        Ok(parsed) => {
+                            if let Err(error) = parsed.validate() {
+                                return respond_error(&mut *respond, 400, &error);
+                            }
+                            for device in &mut config.audio.devices {
+                                device.curve = parsed.clone();
+                            }
+                        }
+                        Err(error) => {
+                            return respond_error(&mut *respond, 400, &format!("curve 不合法：{error}"));
+                        }
                     }
                 }
                 if let Some(devices) = value.get("devices").and_then(|v| v.as_array()) {
+                    let mut unknown = Vec::new();
                     for entry in devices {
                         let Some(id) = entry.get("id").and_then(|v| v.as_str()) else { continue };
-                        if let Some(device) = config.audio.devices.iter_mut().find(|d| d.id == id) {
-                            if let Some(gain) = entry.get("gain_db").and_then(|v| v.as_f64()) {
-                                device.gain_db = gain as f32;
-                            }
-                            if let Some(delay) = entry.get("delay_ms").and_then(|v| v.as_f64()) {
-                                device.delay_ms = delay as f32;
-                            }
-                            if let Some(enabled) = entry.get("enabled").and_then(|v| v.as_bool()) {
-                                device.enabled = enabled;
+                        let Some(device) = config.audio.devices.iter_mut().find(|d| d.id == id) else {
+                            unknown.push(id.to_string());
+                            continue;
+                        };
+                        if let Some(gain) = entry.get("gain_db").and_then(|v| v.as_f64()) {
+                            device.gain_db = gain as f32;
+                        }
+                        if let Some(delay) = entry.get("delay_ms").and_then(|v| v.as_f64()) {
+                            device.delay_ms = delay as f32;
+                        }
+                        if let Some(enabled) = entry.get("enabled").and_then(|v| v.as_bool()) {
+                            device.enabled = enabled;
+                        }
+                        if let Some(rate) = entry.get("sample_rate").and_then(|v| v.as_u64()) {
+                            device.sample_rate = rate as u32;
+                        }
+                        if let Some(curve) = entry.get("curve") {
+                            match serde_json::from_value::<VolumeCurve>(curve.clone()) {
+                                Ok(parsed) => {
+                                    if let Err(error) = parsed.validate() {
+                                        return respond_error(&mut *respond, 400, &format!("设备 {id} 的曲线不合法：{error}"));
+                                    }
+                                    device.curve = parsed;
+                                }
+                                Err(error) => {
+                                    return respond_error(&mut *respond, 400, &format!("设备 {id} 的曲线不合法：{error}"));
+                                }
                             }
                         }
+                    }
+                    if !unknown.is_empty() {
+                        return respond_error(&mut *respond, 400, &format!("未知设备：{}", unknown.join(", ")));
                     }
                 }
                 match app.save_config(config.clone()) {
                     Ok(()) => match app.engine.configure(config.audio.clone()) {
-                        Ok(()) => respond_json(&mut *respond, json!({"ok": true, "audio": config.audio})),
+                        Ok(()) => respond_json(&mut *respond, json!({
+                            "ok": true,
+                            "config_version": config.config_version,
+                            "global_attenuation_percent": config.audio.global_attenuation_percent,
+                            "muted": config.audio.muted,
+                            "devices": config.audio.devices,
+                        })),
                         Err(error) => respond_error(&mut *respond, 500, &format!("{error:#}")),
                     },
                     Err(error) => respond_error(&mut *respond, 400, &format!("{error:#}")),
@@ -363,22 +418,56 @@ fn handle(
         },
         ("POST", "/api/calibration/preview") => match request_json(&request) {
             Ok(value) => {
-                let curve = value
-                    .get("curve")
-                    .and_then(|v| serde_json::from_value::<VolumeCurve>(v.clone()).ok())
-                    .unwrap_or_else(|| app.snapshot().audio.curve);
-                let mut samples = Vec::with_capacity(101);
-                for i in 0..=100 {
-                    let logical = i as f32 / 100.0;
-                    samples.push(json!({"logical": logical, "output": curve.apply(logical)}));
+                let device_id = value.get("device_id").and_then(|v| v.as_str()).map(|v| v.to_string());
+                let config = app.snapshot();
+                let curve = if let Some(curve) = value.get("curve") {
+                    match serde_json::from_value::<VolumeCurve>(curve.clone()) {
+                        Ok(parsed) => parsed,
+                        Err(error) => {
+                            return respond_error(&mut *respond, 400, &format!("curve 不合法：{error}"));
+                        }
+                    }
+                } else if let Some(id) = device_id.as_deref() {
+                    match config.audio.devices.iter().find(|device| device.id == id) {
+                        Some(device) => device.curve.clone(),
+                        None => return respond_error(&mut *respond, 404, &format!("设备不存在：{id}")),
+                    }
+                } else {
+                    return respond_error(&mut *respond, 400, "需要 curve 或 device_id");
+                };
+                if let Err(error) = curve.validate() {
+                    return respond_error(&mut *respond, 400, &error);
                 }
-                respond_json(&mut *respond, json!({"ok": true, "samples": samples, "kind": curve.kind}))
+                let samples: Vec<Value> = (0..=100)
+                    .map(|i| {
+                        let logical = i as f32 / 100.0;
+                        json!({"logical": logical, "output": curve.apply(logical)})
+                    })
+                    .collect();
+                respond_json(&mut *respond, json!({
+                    "ok": true,
+                    "device_id": device_id,
+                    "curve": curve,
+                    "kind": curve.kind,
+                    "points": curve.points,
+                    "samples": samples,
+                }))
             }
             Err(error) => respond_error(&mut *respond, 400, &format!("{error:#}")),
         },
         ("GET", "/api/logs") => {
-            let lines = 200usize;
-            respond_json(&mut *respond, json!({"lines": logging::recent_lines(lines)}))
+            let requested = request
+                .path
+                .split_once('?')
+                .map(|(_, query)| query)
+                .unwrap_or("")
+                .split('&')
+                .filter_map(|pair| pair.split_once('='))
+                .find(|(key, _)| *key == "lines")
+                .and_then(|(_, value)| value.parse::<usize>().ok())
+                .unwrap_or(200);
+            let lines = requested.clamp(1, 500);
+            respond_json(&mut *respond, json!({"lines": logging::recent_lines(lines), "requested": requested}))
         }
         ("POST", "/api/logs/level") => match request_json(&request) {
             Ok(value) => {
@@ -403,7 +492,9 @@ fn handle(
                     None => serde_json::from_value::<Config>(value),
                 };
                 match incoming.context("配置字段不合法") {
-                    Ok(config) => match app.save_config(config.clone()) {
+                    Ok(mut config) => {
+                        config.migrate();
+                        match app.save_config(config.clone()) {
                         Ok(()) => match app.engine.configure(config.audio.clone()) {
                             Ok(()) => {
                                 if let Some(hosts) = app.protocols.lock().unwrap().clone() {
@@ -413,8 +504,9 @@ fn handle(
                             }
                             Err(error) => respond_error(&mut *respond, 500, &format!("{error:#}")),
                         },
-                        Err(error) => respond_error(&mut *respond, 400, &format!("{error:#}")),
-                    },
+                            Err(error) => respond_error(&mut *respond, 400, &format!("{error:#}")),
+                        }
+                    }
                     Err(error) => respond_error(&mut *respond, 400, &format!("{error:#}")),
                 }
             }

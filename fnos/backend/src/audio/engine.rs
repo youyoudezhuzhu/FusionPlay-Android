@@ -58,6 +58,17 @@ pub const DEFAULT_RESCAN_INTERVAL: Duration = Duration::from_secs(2);
 
 const FADE_IN_MS: f32 = 20.0;
 
+/// Every device owns its own curve; the legacy global curve is validated only
+/// when a not-yet-migrated config still carries one.
+fn validate_curves(settings: &AudioSettings) -> Result<()> {
+    for device in &settings.devices {
+        device.curve.validate().map_err(anyhow::Error::msg).map_err(|error| {
+            error.context(format!("设备 {} 的音量曲线不合法", device.id))
+        })?;
+    }
+    Ok(())
+}
+
 fn frames_for_ms(ms: f32, rate: u32) -> usize {
     (((ms.max(0.0) as f64) / 1000.0) * rate.max(1) as f64).round() as usize
 }
@@ -263,6 +274,48 @@ impl DeviceRing {
         dropped_frames
     }
 
+    /// Push samples with a linear block-level gain ramp from `from` to `to`,
+    /// then to `to`. This smooths sender-volume / global-attenuation changes
+    /// without a per-sample curve evaluation (curves are evaluated once per
+    /// block in `write_inner`).
+    fn push_ramped(&self, samples: &[f32], from: f32, to: f32) -> u64 {
+        if samples.is_empty() {
+            return 0;
+        }
+        if (from - to).abs() < 1e-6 || samples.len() < self.channels * 2 {
+            return self.push_scaled(samples, to);
+        }
+        let capacity_samples = self.capacity_frames() * self.channels;
+        let mut dropped_frames = 0u64;
+        let was_empty;
+        {
+            let mut guard = match self.inner.lock() {
+                Ok(guard) => guard,
+                Err(_) => return 0,
+            };
+            was_empty = guard.samples.is_empty();
+            let frames = samples.len() / self.channels;
+            let step = (to - from) / frames.max(1) as f32;
+            for frame in 0..frames {
+                let gain = from + step * frame as f32;
+                for channel in 0..self.channels {
+                    guard.samples.push_back(samples[frame * self.channels + channel] * gain);
+                }
+            }
+            if guard.samples.len() > capacity_samples {
+                let excess = guard.samples.len() - capacity_samples;
+                let excess = excess - excess % self.channels;
+                guard.samples.drain(..excess);
+                dropped_frames = (excess / self.channels) as u64;
+            }
+            guard.last_push = Some(Instant::now());
+        }
+        if was_empty {
+            self.cv.notify_one();
+        }
+        dropped_frames
+    }
+
     /// Wait for data (condvar, not a poll loop) and pop up to `max_frames`.
     fn wait_batch(
         &self,
@@ -379,6 +432,9 @@ struct DeviceWorker {
     provider: Arc<dyn DeviceProvider>,
     source_rate: Arc<AtomicU32>,
     ring: Arc<DeviceRing>,
+    /// Gain of the last block pushed into the ring (curve * global attenuation).
+    /// `u32::MAX` means "uninitialised" so the first block does not ramp from 0.
+    last_curve_gain: AtomicU32,
     control: Arc<DeviceControl>,
     stats: Arc<DeviceStats>,
     info: RwLock<DeviceInfo>,
@@ -412,6 +468,7 @@ impl DeviceWorker {
             provider,
             source_rate,
             ring,
+            last_curve_gain: AtomicU32::new(u32::MAX),
             control,
             stats: Arc::new(DeviceStats::new()),
             info: RwLock::new(info),
@@ -421,6 +478,14 @@ impl DeviceWorker {
 
     fn id(&self) -> &str {
         &self.id
+    }
+
+    /// Snapshot of the current per-device settings (including its curve).
+    fn setting(&self) -> DeviceSetting {
+        self.setting
+            .read()
+            .map(|guard| guard.clone())
+            .unwrap_or_default()
     }
 
     fn online(&self) -> bool {
@@ -894,7 +959,7 @@ impl MultiDeviceBackend {
         settings: &AudioSettings,
         provider: Arc<dyn DeviceProvider>,
     ) -> Result<Arc<Self>> {
-        settings.curve.validate().map_err(anyhow::Error::msg)?;
+        validate_curves(settings)?;
         let backend = Arc::new(Self {
             settings: RwLock::new(Arc::new(settings.clone())),
             workers: RwLock::new(Arc::new(Vec::new())),
@@ -951,7 +1016,7 @@ impl MultiDeviceBackend {
     }
 
     fn configure(&self, settings: &AudioSettings) -> Result<()> {
-        settings.curve.validate().map_err(anyhow::Error::msg)?;
+        validate_curves(settings)?;
         // Publish the new master gain chain first: `write()` only takes a short
         // read lock on this Arc, so volume/mute/curve changes are immediate.
         if let Ok(mut guard) = self.settings.write() {
@@ -1124,17 +1189,17 @@ impl MultiDeviceBackend {
                 }
             }
         }
-        // Master gain chain: sender logical volume -> curve -> global
-        // attenuation -> mute. Computed once per write, never per sample.
+        // Per-device gain chain: sender logical volume -> that device's curve
+        // -> global attenuation -> mute. Curves are evaluated once per block;
+        // the block-level ramp inside the ring smooths changes.
         let settings = match self.settings.read() {
             Ok(guard) => Arc::clone(&guard),
             Err(_) => return,
         };
-        let master_gain = if settings.muted {
+        let global_gain = if settings.muted {
             0.0
         } else {
-            settings.curve.apply(sender_gain)
-                * (settings.global_attenuation_percent.clamp(0.0, 100.0) / 100.0)
+            settings.global_attenuation_percent.clamp(0.0, 100.0) / 100.0
         };
         self.source.store(encode_source(source), Ordering::Relaxed);
         if sample_rate > 0 {
@@ -1147,9 +1212,21 @@ impl MultiDeviceBackend {
         };
         let mut dropped = 0u64;
         for worker in workers.iter() {
-            if worker.accepts_audio() {
-                dropped += worker.ring.push_scaled(samples, master_gain);
+            if !worker.accepts_audio() {
+                continue;
             }
+            let curve_gain = worker.setting().curve.apply(sender_gain);
+            let target = curve_gain * global_gain;
+            let last_bits = worker.last_curve_gain.load(Ordering::Relaxed);
+            let from = if last_bits == u32::MAX {
+                target
+            } else {
+                bits_f32(last_bits)
+            };
+            worker
+                .last_curve_gain
+                .store(f32_bits(target), Ordering::Relaxed);
+            dropped += worker.ring.push_ramped(samples, from, target);
         }
         if dropped > 0 {
             self.dropped_frames.fetch_add(dropped, Ordering::Relaxed);

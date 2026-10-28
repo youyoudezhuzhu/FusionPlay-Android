@@ -1,0 +1,220 @@
+//! Integration tests for the device-aware calibration HTTP API.
+//!
+//! Uses the real HTTP server and a `NullBackend` (no sound card), so this runs
+//! on CI. Verifies that per-device curves are stored independently, survive a
+//! service restart, and that the legacy global-curve request stays compatible.
+
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::path::Path;
+use std::sync::{Arc, RwLock};
+use std::time::Duration;
+
+use fusionplay_fnos::audio::{AudioEngine, NullBackend};
+use fusionplay_fnos::config::{AudioSettings, Config, DeviceSetting};
+use fusionplay_fnos::http::{self, HttpApp};
+use fusionplay_fnos::state::AppState;
+use fusionplay_fnos::volume::{CurveKind, VolumeCurve};
+
+fn free_port() -> SocketAddr {
+    for _ in 0..50 {
+        if let Ok(listener) = TcpListener::bind("127.0.0.1:0") {
+            if let Ok(address) = listener.local_addr() {
+                drop(listener);
+                return address;
+            }
+        }
+    }
+    panic!("no free port");
+}
+
+struct Http {
+    address: SocketAddr,
+}
+
+impl Http {
+    fn request(&self, method: &str, path: &str, body: Option<&str>) -> (u16, String) {
+        let mut stream = TcpStream::connect(self.address).expect("connect");
+        stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+        let payload = body.unwrap_or("");
+        let head = format!(
+            "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            payload.len()
+        );
+        stream.write_all(head.as_bytes()).expect("write head");
+        stream.write_all(payload.as_bytes()).expect("write body");
+        let mut response = String::new();
+        stream.read_to_string(&mut response).expect("read response");
+        let status: u16 = response
+            .split_whitespace()
+            .nth(1)
+            .and_then(|value| value.parse().ok())
+            .expect("status code");
+        let body = response.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
+        (status, body)
+    }
+}
+
+fn device(id: &str, curve: VolumeCurve) -> DeviceSetting {
+    DeviceSetting {
+        id: id.to_string(),
+        name: id.to_string(),
+        enabled: true,
+        gain_db: 0.0,
+        delay_ms: 0.0,
+        sample_rate: 0,
+        curve,
+    }
+}
+
+fn start_app(dir: &Path, devices: Vec<DeviceSetting>) -> (Arc<HttpApp>, Http) {
+    let config_path = dir.join("config.json");
+    let mut config = Config::default();
+    config.audio.devices = devices;
+    config.save(&config_path).expect("save initial config");
+    let config = Config::load(&config_path).expect("load initial config");
+    let engine = AudioEngine::new(config.audio.clone(), NullBackend::new()).expect("engine");
+    let app = Arc::new(HttpApp {
+        config_path,
+        config: RwLock::new(config),
+        state: AppState::new(),
+        engine,
+        www_dir: dir.join("www"),
+        gateway_prefix: "/app/fusionplay-fnos".to_string(),
+        started: std::time::Instant::now(),
+        protocols: std::sync::Mutex::new(None),
+    });
+    let address = free_port();
+    let _servers = http::start(Arc::clone(&app), Some(address), None).expect("http start");
+    std::mem::forget(_servers); // detached threads live for the test process
+    (app, Http { address })
+}
+
+fn curve(kind: CurveKind, points: Vec<(f32, f32)>) -> VolumeCurve {
+    VolumeCurve { kind, points }
+}
+
+#[test]
+fn device_curves_are_independent_and_survive_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_app, http) = start_app(
+        dir.path(),
+        vec![
+            device("hw:a", curve(CurveKind::Linear, vec![])),
+            device("hw:b", curve(CurveKind::Balanced, vec![])),
+        ],
+    );
+    let custom = r#"{"kind":"custom","points":[[0.25,0.12],[0.75,0.66]]}"#;
+    let payload = format!(
+        r#"{{"global_attenuation_percent":80,"muted":false,"devices":[
+            {{"id":"hw:a","gain_db":-6,"delay_ms":25,"curve":{custom}}},
+            {{"id":"hw:b","gain_db":0,"delay_ms":0,"curve":{{"kind":"soft","points":[]}}}}
+        ]}}"#
+    );
+    let (status, body) = http.request("PUT", "/api/calibration", Some(&payload));
+    assert_eq!(status, 200, "{body}");
+
+    // Distinct curves are returned by GET /api/calibration.
+    let (status, body) = http.request("GET", "/api/calibration", None);
+    assert_eq!(status, 200);
+    let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let devices = value["devices"].as_array().unwrap();
+    let a = devices.iter().find(|d| d["id"] == "hw:a").unwrap();
+    let b = devices.iter().find(|d| d["id"] == "hw:b").unwrap();
+    assert_eq!(a["curve"]["kind"], "custom");
+    let point_y = a["curve"]["points"][1][1].as_f64().unwrap();
+    assert!((point_y - 0.66).abs() < 1e-5, "point y = {point_y}");
+    assert_eq!(b["curve"]["kind"], "soft");
+    assert_eq!(a["gain_db"], -6.0);
+    assert_eq!(a["delay_ms"], 25.0);
+
+    // The config file on disk keeps both curves (service restart scenario).
+    let loaded = Config::load(&dir.path().join("config.json")).unwrap();
+    assert_eq!(loaded.config_version, 2);
+    let a = loaded.audio.devices.iter().find(|d| d.id == "hw:a").unwrap();
+    let b = loaded.audio.devices.iter().find(|d| d.id == "hw:b").unwrap();
+    assert_eq!(a.curve.points, vec![(0.25, 0.12), (0.75, 0.66)]);
+    assert_eq!(b.curve.kind, CurveKind::Soft);
+
+    // Preview by device_id uses that device's stored curve.
+    let (status, body) = http.request(
+        "POST",
+        "/api/calibration/preview",
+        Some(r#"{"device_id":"hw:a"}"#),
+    );
+    assert_eq!(status, 200);
+    let preview: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(preview["device_id"], "hw:a");
+    assert_eq!(preview["curve"]["kind"], "custom");
+    let samples = preview["samples"].as_array().unwrap();
+    assert_eq!(samples.len(), 101);
+    // custom curve: 25 % logical -> ~12 % output.
+    let at_25 = &samples[25];
+    let output = at_25["output"].as_f64().unwrap();
+    assert!((output - 0.12).abs() < 0.01, "preview output {output}");
+}
+
+#[test]
+fn legacy_global_curve_request_applies_to_all_devices() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_app, http) = start_app(
+        dir.path(),
+        vec![
+            device("hw:a", curve(CurveKind::Balanced, vec![])),
+            device("hw:b", curve(CurveKind::Linear, vec![])),
+        ],
+    );
+    let payload = r#"{"curve":{"kind":"soft","points":[]},"global_attenuation_percent":70}"#;
+    let (status, body) = http.request("PUT", "/api/calibration", Some(payload));
+    assert_eq!(status, 200, "{body}");
+    let loaded = Config::load(&dir.path().join("config.json")).unwrap();
+    assert!(loaded.audio.curve.is_default(), "legacy curve must not be stored globally");
+    for device in &loaded.audio.devices {
+        assert_eq!(device.curve.kind, CurveKind::Soft, "{}", device.id);
+    }
+    assert!((loaded.audio.global_attenuation_percent - 70.0).abs() < 1e-6);
+}
+
+#[test]
+fn invalid_device_curve_is_rejected_and_config_is_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_app, http) = start_app(dir.path(), vec![device("hw:a", curve(CurveKind::Linear, vec![]))]);
+    let payload = r#"{"devices":[{"id":"hw:a","curve":{"kind":"custom","points":[[0.6,0.5],[0.3,0.2]]}}]}"#;
+    let (status, _body) = http.request("PUT", "/api/calibration", Some(payload));
+    assert_eq!(status, 400);
+    let loaded = Config::load(&dir.path().join("config.json")).unwrap();
+    assert_eq!(loaded.audio.devices[0].curve.kind, CurveKind::Linear);
+}
+
+
+#[test]
+fn import_v1_export_migrates_curves_to_devices() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_app, http) = start_app(dir.path(), vec![device("hw:a", curve(CurveKind::Linear, vec![]))]);
+    let v1 = r#"{"config":{
+        "receiver":{"name":"LegacyImport"},
+        "audio":{
+          "global_attenuation_percent":80,
+          "curve":{"kind":"custom","points":[[0.25,0.15],[0.75,0.7]]},
+          "devices":[{"id":"hw:a","name":"A","enabled":true,"gain_db":-3,"delay_ms":12,"sample_rate":0},
+                     {"id":"hw:b","name":"B","enabled":false,"gain_db":0,"delay_ms":0,"sample_rate":0}]
+        }
+    }}"#;
+    let (status, body) = http.request("POST", "/api/import", Some(v1));
+    assert_eq!(status, 200, "{body}");
+    let loaded = Config::load(&dir.path().join("config.json")).unwrap();
+    assert_eq!(loaded.config_version, 2);
+    assert_eq!(loaded.receiver.name, "LegacyImport");
+    assert!(loaded.audio.curve.is_default(), "legacy global curve must be cleared");
+    for device in &loaded.audio.devices {
+        assert_eq!(
+            device.curve.points,
+            vec![(0.25, 0.15), (0.75, 0.7)],
+            "{} did not receive the legacy curve",
+            device.id
+        );
+    }
+    let a = loaded.audio.devices.iter().find(|d| d.id == "hw:a").unwrap();
+    assert_eq!(a.gain_db, -3.0);
+    assert_eq!(a.delay_ms, 12.0);
+}

@@ -29,6 +29,7 @@ use fusionplay_fnos::audio::engine::MultiDeviceBackend;
 use fusionplay_fnos::audio::{AudioEngine, DeviceInfo, EngineStatus, OutputBackend};
 use fusionplay_fnos::config::{AudioSettings, DeviceSetting};
 use fusionplay_fnos::session::Source;
+use fusionplay_fnos::volume::{CurveKind, VolumeCurve};
 
 const MASTER_RATE: u32 = 48_000;
 const CHANNELS: usize = 2;
@@ -108,6 +109,8 @@ struct Runtime {
     gate_cv: Condvar,
     writes: AtomicU64,
     frames: AtomicU64,
+    /// Last rendered f32 samples (post device gain), for gain-chain assertions.
+    captured: Mutex<Vec<f32>>,
 }
 
 impl Runtime {
@@ -118,6 +121,7 @@ impl Runtime {
             gate_cv: Condvar::new(),
             writes: AtomicU64::new(0),
             frames: AtomicU64::new(0),
+            captured: Mutex::new(Vec::new()),
         }
     }
 
@@ -176,6 +180,12 @@ impl DeviceSink for MockSink {
         self.runtime
             .frames
             .fetch_add(frames as u64, Ordering::Relaxed);
+        const CAPTURE_LIMIT: usize = 2_000_000;
+        if let Ok(mut captured) = self.runtime.captured.lock() {
+            if captured.len() < CAPTURE_LIMIT {
+                captured.extend_from_slice(samples);
+            }
+        }
         Ok(())
     }
 
@@ -249,6 +259,20 @@ impl MockProvider {
         runtime.gate_cv.notify_all();
     }
 
+    fn captured(&self, id: &str) -> Vec<f32> {
+        self.runtime(id)
+            .captured
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default()
+    }
+
+    fn clear_captured(&self, id: &str) {
+        if let Ok(mut guard) = self.runtime(id).captured.lock() {
+            guard.clear();
+        }
+    }
+
     fn writes(&self, id: &str) -> u64 {
         self.runtime(id).writes.load(Ordering::Relaxed)
     }
@@ -308,6 +332,7 @@ fn device_setting(id: &str, sample_rate: u32) -> DeviceSetting {
         gain_db: 0.0,
         delay_ms: 0.0,
         sample_rate,
+        curve: Default::default(),
     }
 }
 
@@ -918,4 +943,101 @@ fn write_is_non_blocking_even_with_a_stalled_device() {
     // Unknown device ids are an error, not a silent no-op.
     assert!(engine.test_tone("nope").is_err());
     drop(gate);
+}
+
+
+// ---------------------------------------------------------------------------
+// Per-device volume curves / gain chain
+// ---------------------------------------------------------------------------
+
+fn push_constant(engine: &AudioEngine, value: f32, sender_gain: f32, chunks: usize) {
+    let frames = 480usize;
+    let mut chunk = Vec::with_capacity(frames * CHANNELS);
+    for _ in 0..frames {
+        chunk.push(value);
+        chunk.push(value);
+    }
+    for _ in 0..chunks {
+        engine.push_pcm(Source::AirPlay, 1, sender_gain, MASTER_RATE, CHANNELS as u16, &chunk);
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// Mean absolute amplitude of the last 2000 captured samples (steady state,
+/// after gain ramps and resampler filters have settled).
+fn tail_amplitude(samples: &[f32]) -> f32 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    let tail = &samples[samples.len().saturating_sub(2000)..];
+    tail.iter().map(|sample| sample.abs()).sum::<f32>() / tail.len() as f32
+}
+
+#[test]
+fn per_device_curves_gain_global_and_mute_are_independent() {
+    let _serial = serial_guard();
+    let provider = MockProvider::new(vec![
+        Spec::new("mock:a", MASTER_RATE as f64, SPEED),
+        Spec::new("mock:b", MASTER_RATE as f64, SPEED),
+    ]);
+    let mut device_a = device_setting("mock:a", 0);
+    device_a.curve = VolumeCurve { kind: CurveKind::Linear, points: vec![] };
+    let mut device_b = device_setting("mock:b", 0);
+    // Custom curve maps the top of the sender range to only 50 % amplitude.
+    device_b.curve = VolumeCurve {
+        kind: CurveKind::Custom,
+        points: vec![(0.0, 0.0), (1.0, 0.5)],
+    };
+    let settings = audio_settings(vec![device_a, device_b]);
+    let (engine, _backend) = build_engine(&settings, Arc::clone(&provider));
+    assert!(wait_until(Duration::from_secs(5), || online(&engine) == 2));
+
+    // Same sender logical volume (100 %), same raw PCM: each device must apply
+    // its own curve. Linear -> 0.5, custom(0.5 at top) -> 0.25.
+    push_constant(&engine, 0.5, 1.0, 120);
+    settle(&engine);
+    let amp_a = tail_amplitude(&provider.captured("mock:a"));
+    let amp_b = tail_amplitude(&provider.captured("mock:b"));
+    assert!((amp_a - 0.5).abs() < 0.06, "device A (linear) amplitude {amp_a}");
+    assert!((amp_b - 0.25).abs() < 0.05, "device B (custom) amplitude {amp_b}");
+    assert!(amp_a > amp_b * 1.5, "curves must be independent per device");
+
+    // Global attenuation (50 %) and per-device dB (-6 dB on A only) compose
+    // with the per-device curves: A ~= 0.125, B ~= 0.125.
+    let mut calibrated = settings.clone();
+    calibrated.global_attenuation_percent = 50.0;
+    calibrated.devices[0].gain_db = -6.0;
+    engine.configure(calibrated.clone()).expect("configure calibrated");
+    provider.clear_captured("mock:a");
+    provider.clear_captured("mock:b");
+    push_constant(&engine, 0.5, 1.0, 120);
+    settle(&engine);
+    let amp_a = tail_amplitude(&provider.captured("mock:a"));
+    let amp_b = tail_amplitude(&provider.captured("mock:b"));
+    assert!((amp_a - 0.125).abs() < 0.03, "device A with -6 dB + global 50%: {amp_a}");
+    assert!((amp_b - 0.125).abs() < 0.03, "device B with global 50%: {amp_b}");
+
+    // Global mute silences every device, regardless of curves/gains.
+    let mut muted = calibrated.clone();
+    muted.muted = true;
+    engine.configure(muted.clone()).expect("configure muted");
+    provider.clear_captured("mock:a");
+    provider.clear_captured("mock:b");
+    push_constant(&engine, 0.5, 1.0, 80);
+    settle(&engine);
+    assert!(tail_amplitude(&provider.captured("mock:a")) < 0.005, "global mute A");
+    assert!(tail_amplitude(&provider.captured("mock:b")) < 0.005, "global mute B");
+
+    // Sender mute (logical gain 0) wins over local calibration: curves map
+    // 0 -> 0 and nothing reaches the devices.
+    let mut unmuted = muted.clone();
+    unmuted.muted = false;
+    engine.configure(unmuted).expect("configure unmuted");
+    provider.clear_captured("mock:a");
+    push_constant(&engine, 0.5, 0.0, 80);
+    settle(&engine);
+    assert!(
+        tail_amplitude(&provider.captured("mock:a")) < 0.005,
+        "sender mute must produce silence"
+    );
 }

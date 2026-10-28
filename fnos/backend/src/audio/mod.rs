@@ -102,7 +102,13 @@ impl AudioEngine {
     }
 
     pub fn configure(&self, settings: AudioSettings) -> Result<()> {
-        settings.curve.validate().map_err(anyhow::Error::msg)?;
+        for device in &settings.devices {
+            device
+                .curve
+                .validate()
+                .map_err(anyhow::Error::msg)
+                .map_err(|error| error.context(format!("设备 {} 的音量曲线不合法", device.id)))?;
+        }
         self.backend.configure(&settings)?;
         *self.settings.write().unwrap() = settings;
         Ok(())

@@ -191,6 +191,10 @@ pub struct ProtocolHosts {
     core: Mutex<Option<CoreHandle>>,
     miplay: Mutex<Option<MiPlayHandle>>,
     shutdown: Arc<AtomicBool>,
+    /// Fingerprint of the protocol-relevant config that is currently applied.
+    /// Audio-only saves must NOT restart the protocol hosts (that would cut
+    /// AirPlay/DLNA/MiPlay for 1–3 s on every volume tweak).
+    applied: Mutex<Option<String>>,
 }
 
 impl ProtocolHosts {
@@ -214,9 +218,22 @@ impl ProtocolHosts {
             core: Mutex::new(None),
             miplay: Mutex::new(None),
             shutdown: Arc::new(AtomicBool::new(false)),
+            applied: Mutex::new(None),
         });
         hosts.apply(config)?;
         Ok(hosts)
+    }
+
+    fn fingerprint(config: &Config) -> String {
+        serde_json::json!({
+            "name": config.receiver.name,
+            "pin": config.receiver.pin,
+            "interface": config.receiver.interface,
+            "airplay": config.protocols.airplay.enabled,
+            "dlna": config.protocols.dlna.enabled,
+            "miplay": config.protocols.miplay.enabled,
+        })
+        .to_string()
     }
 
     fn apply(&self, config: &Config) -> Result<()> {
@@ -243,10 +260,21 @@ impl ProtocolHosts {
             let mut state = self.state.state.write().unwrap();
             state.miplay.state = "disabled".into();
         }
+        *self.applied.lock().unwrap() = Some(Self::fingerprint(config));
         Ok(())
     }
 
+    /// Apply protocol-relevant config changes. Audio-only saves (curves/gain/
+    /// delay/mute) are a no-op so playback is not interrupted.
     pub fn restart(&self, config: &Config) -> Result<()> {
+        let fingerprint = Self::fingerprint(config);
+        if self.applied.lock().unwrap().as_deref() == Some(fingerprint.as_str()) {
+            let mut state = self.state.state.write().unwrap();
+            state.airplay.enabled = config.protocols.airplay.enabled;
+            state.dlna.enabled = config.protocols.dlna.enabled;
+            state.miplay.enabled = config.protocols.miplay.enabled;
+            return Ok(());
+        }
         self.apply(config)
     }
 

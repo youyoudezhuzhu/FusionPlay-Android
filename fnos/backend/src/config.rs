@@ -10,9 +10,24 @@ use std::path::{Path, PathBuf};
 
 use crate::volume::VolumeCurve;
 
+/// Current on-disk config schema. v1 had a single global `audio.curve`; v2
+/// moves the curve into every device (`audio.devices[].curve`). Keeping the
+/// version explicit makes the one-way migration idempotent and safe for
+/// importing v1 exports.
+pub const CONFIG_VERSION: u32 = 2;
+
+/// Missing `config_version` means a v1 config file (the field did not exist
+/// then), even though `Config::default()` writes the current version.
+fn legacy_config_version() -> u32 {
+    0
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
+    /// `0`/missing = v1 config that still needs migration.
+    #[serde(default = "legacy_config_version")]
+    pub config_version: u32,
     pub receiver: ReceiverSettings,
     pub protocols: ProtocolSettings,
     pub audio: AudioSettings,
@@ -22,6 +37,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            config_version: CONFIG_VERSION,
             receiver: ReceiverSettings::default(),
             protocols: ProtocolSettings::default(),
             audio: AudioSettings::default(),
@@ -84,6 +100,10 @@ pub struct AudioSettings {
     pub sample_rate: u32,
     /// Global calibration attenuation, 0–100 % (100 = no extra attenuation).
     pub global_attenuation_percent: f32,
+    /// Legacy v1 global curve. It is migrated into each device on load and is
+    /// **not** used by the audio engine any more. Kept (and skipped when
+    /// neutral) so old exports can still be imported.
+    #[serde(default, skip_serializing_if = "VolumeCurve::is_default")]
     pub curve: VolumeCurve,
     pub muted: bool,
     pub devices: Vec<DeviceSetting>,
@@ -115,11 +135,22 @@ pub struct DeviceSetting {
     pub delay_ms: f32,
     /// Preferred device rate, 0 = device default.
     pub sample_rate: u32,
+    /// Per-device volume response curve (sender logical volume -> amplitude).
+    #[serde(default)]
+    pub curve: VolumeCurve,
 }
 
 impl Default for DeviceSetting {
     fn default() -> Self {
-        Self { id: String::new(), name: String::new(), enabled: false, gain_db: 0.0, delay_ms: 0.0, sample_rate: 0 }
+        Self {
+            id: String::new(),
+            name: String::new(),
+            enabled: false,
+            gain_db: 0.0,
+            delay_ms: 0.0,
+            sample_rate: 0,
+            curve: VolumeCurve::default(),
+        }
     }
 }
 
@@ -142,9 +173,15 @@ impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         match std::fs::read_to_string(path) {
             Ok(text) => {
-                let cfg: Config = serde_json::from_str(&text)
+                let mut cfg: Config = serde_json::from_str(&text)
                     .with_context(|| format!("无法解析配置 {}", path.display()))?;
+                let migrated = cfg.migrate();
                 cfg.validate()?;
+                if migrated {
+                    // Persist the migrated schema once, so a downgrade cannot
+                    // silently resurrect the old global curve.
+                    cfg.save(path)?;
+                }
                 Ok(cfg)
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -156,14 +193,39 @@ impl Config {
         }
     }
 
+    /// One-way, idempotent v1 -> v2 migration: the old global curve becomes the
+    /// default curve of every device that does not already have its own curve.
+    /// Returns whether anything changed (callers persist the result).
+    pub fn migrate(&mut self) -> bool {
+        if self.config_version >= CONFIG_VERSION {
+            return false;
+        }
+        let legacy = self.audio.curve.clone();
+        let legacy_is_effective = !legacy.is_default();
+        if legacy_is_effective {
+            for device in &mut self.audio.devices {
+                if device.curve.is_default() {
+                    device.curve = legacy.clone();
+                }
+            }
+        }
+        self.audio.curve = VolumeCurve::default();
+        self.config_version = CONFIG_VERSION;
+        true
+    }
+
     pub fn save(&self, path: &Path) -> Result<()> {
         self.validate()?;
+        // Always write the current schema version, even when the caller did not
+        // bump it explicitly (e.g. after import).
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("无法创建配置目录 {}", parent.display()))?;
         }
         let tmp = path.with_extension("json.tmp");
-        let text = serde_json::to_string_pretty(self)?;
+        let mut snapshot = self.clone();
+        snapshot.config_version = CONFIG_VERSION;
+        let text = serde_json::to_string_pretty(&snapshot)?;
         std::fs::write(&tmp, text).with_context(|| format!("无法写临时配置 {}", tmp.display()))?;
         std::fs::rename(&tmp, path)
             .with_context(|| format!("无法落盘配置 {}", path.display()))?;
@@ -180,7 +242,16 @@ impl Config {
         if !(0.0..=100.0).contains(&self.audio.global_attenuation_percent) {
             anyhow::bail!("全局衰减必须在 0–100%");
         }
-        self.audio.curve.validate().map_err(anyhow::Error::msg)?;
+        if !self.audio.curve.is_default() {
+            self.audio.curve.validate().map_err(anyhow::Error::msg)?;
+        }
+        for device in &self.audio.devices {
+            device
+                .curve
+                .validate()
+                .map_err(anyhow::Error::msg)
+                .with_context(|| format!("设备 {} 的音量曲线不合法", device.id))?;
+        }
         for device in &self.audio.devices {
             if !(-30.0..=0.0).contains(&device.gain_db) {
                 anyhow::bail!("设备 {} 的响度平衡必须在 -30–0 dB", device.id);
@@ -200,6 +271,8 @@ impl Config {
         self.logging = imported.logging;
         // Keep the local receiver identity name? No: config import is explicit.
         self.receiver = imported.receiver;
+        self.config_version = imported.config_version;
+        self.migrate();
         Ok(())
     }
 }
@@ -218,45 +291,140 @@ pub fn default_config_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::volume::CurveKind;
+
+    fn legacy_json() -> String {
+        r#"{
+          "receiver": {"name": "Legacy"},
+          "audio": {
+            "global_attenuation_percent": 80,
+            "curve": {"kind": "custom", "points": [[0.25, 0.15], [0.75, 0.7]]},
+            "devices": [
+              {"id": "hw:a", "name": "A", "enabled": true, "gain_db": -3, "delay_ms": 12, "sample_rate": 0},
+              {"id": "hw:b", "name": "B", "enabled": false, "gain_db": 0, "delay_ms": 0, "sample_rate": 48000}
+            ]
+          }
+        }"#
+        .to_string()
+    }
 
     #[test]
-    fn roundtrip_and_atomic_save() {
+    fn roundtrip_keeps_per_device_curve_and_skips_legacy_curve() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
         let mut cfg = Config::default();
         cfg.receiver.name = "测试接收器".into();
         cfg.audio.global_attenuation_percent = 80.0;
-        cfg.audio.curve.kind = crate::volume::CurveKind::Custom;
-        cfg.audio.curve.points = vec![(0.3, 0.2), (0.7, 0.6)];
-        cfg.audio.devices.push(DeviceSetting {
+        let mut device = DeviceSetting {
             id: "hw:CARD=ultra,DEV=0".into(),
             name: "极境-ultra".into(),
             enabled: true,
             gain_db: -3.0,
             delay_ms: 12.0,
             sample_rate: 48_000,
-        });
+            ..Default::default()
+        };
+        device.curve = VolumeCurve { kind: CurveKind::Custom, points: vec![(0.3, 0.2), (0.7, 0.6)] };
+        cfg.audio.devices.push(device);
         cfg.save(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("\"config_version\": 2"));
+        assert!(!text.contains("\"curve\": {\n      \"kind\": \"balanced\""), "legacy global curve must not be written");
         let loaded = Config::load(&path).unwrap();
         assert_eq!(loaded.receiver.name, "测试接收器");
+        assert_eq!(loaded.config_version, CONFIG_VERSION);
         assert!((loaded.audio.global_attenuation_percent - 80.0).abs() < 1e-6);
         assert_eq!(loaded.audio.devices.len(), 1);
-        assert_eq!(loaded.audio.curve.points, vec![(0.3, 0.2), (0.7, 0.6)]);
+        assert_eq!(loaded.audio.devices[0].curve.points, vec![(0.3, 0.2), (0.7, 0.6)]);
+        assert!(loaded.audio.curve.is_default(), "legacy curve is cleared after migration");
         // Default file is created on first load.
         let missing = dir.path().join("new.json");
         let created = Config::load(&missing).unwrap();
         assert_eq!(created.receiver.name, "FusionPlay");
+        assert_eq!(created.config_version, CONFIG_VERSION);
         assert!(missing.exists());
     }
 
     #[test]
-    fn rejects_invalid_calibration() {
+    fn migrates_v1_global_curve_to_each_device_and_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, legacy_json()).unwrap();
+        let cfg = Config::load(&path).unwrap();
+        assert_eq!(cfg.config_version, CONFIG_VERSION);
+        assert!(cfg.audio.curve.is_default());
+        assert_eq!(cfg.audio.devices.len(), 2);
+        for device in &cfg.audio.devices {
+            assert_eq!(device.curve.kind, CurveKind::Custom, "{} got legacy curve", device.id);
+            assert_eq!(device.curve.points, vec![(0.25, 0.15), (0.75, 0.7)]);
+        }
+        // gain/delay/enabled/sample_rate survive the migration untouched.
+        assert_eq!(cfg.audio.devices[0].gain_db, -3.0);
+        assert_eq!(cfg.audio.devices[0].delay_ms, 12.0);
+        assert!(cfg.audio.devices[0].enabled);
+        assert_eq!(cfg.audio.devices[1].sample_rate, 48_000);
+        // The migrated file is written back and no longer carries the global curve.
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("\"config_version\": 2"));
+        assert!(!text.contains("\"global_attenuation_percent\": 80.0,\n    \"curve\""));
+    }
+
+    #[test]
+    fn migration_is_idempotent_and_never_overwrites_explicit_device_curves() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let legacy = legacy_json().replace(
+            r#"{"id": "hw:a", "name": "A", "enabled": true, "gain_db": -3, "delay_ms": 12, "sample_rate": 0}"#,
+            r#"{"id": "hw:a", "name": "A", "enabled": true, "gain_db": -3, "delay_ms": 12, "sample_rate": 0, "curve": {"kind": "custom", "points": [[0.5, 0.9]]}}"#,
+        );
+        std::fs::write(&path, legacy).unwrap();
+        let first = Config::load(&path).unwrap();
+        let device_a = first.audio.devices.iter().find(|d| d.id == "hw:a").unwrap();
+        assert_eq!(device_a.curve.points, vec![(0.5, 0.9)], "explicit curve must win");
+        let device_b = first.audio.devices.iter().find(|d| d.id == "hw:b").unwrap();
+        assert_eq!(device_b.curve.points, vec![(0.25, 0.15), (0.75, 0.7)]);
+        // Second load is a no-op.
+        let second = Config::load(&path).unwrap();
+        assert_eq!(second.config_version, CONFIG_VERSION);
+        assert_eq!(second.audio.devices[0].curve, first.audio.devices[0].curve);
+        assert_eq!(second.audio.devices[1].curve, first.audio.devices[1].curve);
+        let mut third = second.clone();
+        assert!(!third.migrate(), "migration must report no change once on v2");
+    }
+
+    #[test]
+    fn importing_v1_export_migrates_and_keeps_calibration() {
+        let imported: Config = serde_json::from_str(&legacy_json()).unwrap();
+        let mut local = Config::default();
+        local.apply_import(imported).unwrap();
+        assert_eq!(local.config_version, CONFIG_VERSION);
+        assert!(local.audio.curve.is_default());
+        assert_eq!(local.audio.devices.len(), 2);
+        assert_eq!(local.audio.devices[0].gain_db, -3.0);
+        assert_eq!(local.audio.devices[0].curve.kind, CurveKind::Custom);
+    }
+
+    #[test]
+    fn rejects_invalid_device_curve() {
         let mut cfg = Config::default();
-        cfg.audio.curve.kind = crate::volume::CurveKind::Custom;
-        cfg.audio.curve.points = vec![(0.5, 0.6), (0.4, 0.2)];
-        assert!(cfg.validate().is_err());
-        cfg.audio.curve.points.clear();
-        cfg.audio.devices.push(DeviceSetting { id: "x".into(), gain_db: 3.0, ..Default::default() });
-        assert!(cfg.validate().is_err());
+        cfg.audio.devices.push(DeviceSetting {
+            id: "x".into(),
+            curve: VolumeCurve { kind: CurveKind::Custom, points: vec![(0.5, 0.6), (0.4, 0.2)] },
+            ..Default::default()
+        });
+        assert!(cfg.validate().is_err(), "non-monotonic per-device curve must be rejected");
+        cfg.audio.devices[0].curve.points.clear();
+        cfg.audio.devices[0].gain_db = 3.0;
+        assert!(cfg.validate().is_err(), "positive device gain must be rejected");
+        cfg.audio.devices[0].gain_db = 0.0;
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn default_config_is_v2_with_neutral_device_curves() {
+        let cfg = Config::default();
+        assert_eq!(cfg.config_version, CONFIG_VERSION);
+        assert!(cfg.audio.curve.is_default());
+        assert!(cfg.audio.devices.is_empty());
     }
 }

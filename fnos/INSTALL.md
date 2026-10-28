@@ -1,6 +1,6 @@
 # FusionPlay fnOS 安装与验收指南
 
-面向最终用户/测试同学。安装包：`fusionplay-fnos.fpk`（appname `fusionplay-fnos`，当前 `0.1.0`，x86_64）。
+面向最终用户/测试同学。安装包：`fusionplay-fnos.fpk`（appname `fusionplay-fnos`，当前 `0.2.0`，x86_64）。
 构建、CI 与本地沙箱测试见 [fnos-build.md](fnos-build.md)；功能与限制见 [README.md](README.md)。
 
 ## 0. 前置条件
@@ -81,7 +81,7 @@ sudo -u fusionplay-fnos test -r /dev/snd/controlC0 && echo "audio ok" || echo "a
 ### 4.1 应用状态与服务
 
 ```bash
-trim-cli app status fusionplay-fnos          # status: running，version = 0.1.0
+trim-cli app status fusionplay-fnos          # status: running，version = 0.2.0
 sudo ss -lntp | grep 18080                   # 127.0.0.1:18080 有监听
 pgrep -af 'fusionplay-fnos/bin/fusionplay-fnos'   # 只有 1 个进程
 ```
@@ -90,7 +90,7 @@ pgrep -af 'fusionplay-fnos/bin/fusionplay-fnos'   # 只有 1 个进程
 
 ```bash
 curl -s http://127.0.0.1:18080/healthz
-# 期望：{"status":"ok","version":"0.1.0","uptime":...}
+# 期望：{"status":"ok","version":"0.2.0","uptime":...}
 
 # 走网关 socket（应用实际接法；路径经 /var/apps/.../target 软链）
 curl -s --unix-socket /var/apps/fusionplay-fnos/target/fusionplay-fnos.sock \
@@ -114,9 +114,10 @@ sudo avahi-browse -rt _raop._tcp   | head
 
 ### 4.4 桌面入口 / Web UI
 
-- 桌面点击 FusionPlay 图标，应打开中文管理面板（概览 / 协议 / 声卡 / 校准 / 设置诊断）。
+- 桌面点击 FusionPlay 图标，应打开中文管理面板（**概览 / 音频 / 接收 / 设置** 四页）。
 - 浏览器直接访问网关路径 `http://<NAS>:5666/app/fusionplay-fnos/`（需登录飞牛），应返回 200，
-  页面资源（`app.js` / `style.css`）不 404。
+  页面资源（`js/main.js`、`js/page-audio.js`、`style.css`）不 404。
+- 主题按钮应在「跟随系统 → 浅色 → 深色」间切换，所有卡片/输入/曲线同步换色。
 - 远程访问请认准桌面图标或 `/app/fusionplay-fnos/`；**不要**把 `http://<NAS>:18080` 当对外入口
   （端口只绑 loopback）。
 
@@ -127,7 +128,7 @@ sudo tail -n 100 /vol1/@appdata/fusionplay-fnos/fusionplay.log
 sudo tail -n 100 /vol1/@appdata/fusionplay-fnos/app.log
 ```
 
-期望：有 `FusionPlay fnOS 0.1.0 启动`、`HTTP 已启动`、`协议宿主已启动`；
+期望：有 `FusionPlay fnOS 0.2.0 启动`、`HTTP 已启动`、`协议宿主已启动`；
 没有反复重启/崩溃堆栈。日志超过 5 MiB 会原地保留尾部 1 MiB（inode 不变）。
 
 ### 4.6 数据与配置目录
@@ -166,10 +167,13 @@ sudo ls -l /vol1/@appdata/fusionplay-fnos/              # app.log、fusionplay.l
 - [ ] 老发送端（旧版固定密钥）可用（兼容默认开启）。
 - [ ] 厂商准入失败时：日志写明原因，UI 不显示虚假成功。
 
-### 5.4 多声卡与校准
+### 5.4 多声卡与逐设备校准
 
-- [ ] 至少两块输出设备时，UI 声卡页都能看到并启用；同时出声（如 HDMI + USB DAC）。
+- [ ] 至少两块输出设备时，UI「音频」页都能看到并启用；同时出声（如 HDMI + USB DAC）。
+- [ ] 点击不同设备卡片，右侧显示该设备自己的设置（名称/响度/延迟/曲线互不串扰）。
+- [ ] 给不同设备选择不同预设/自定义曲线：听感/输出幅度应不同；重启后各自的曲线保留。
 - [ ] 拖动每设备增益（dB）与延迟（ms）能听到变化；重启后设置保留（config.json）。
+- [ ] 全局衰减与全局静音对所有设备同时生效，但不改变手机端显示的主音量。
 - [ ] 播放中拔掉一块声卡：其它设备不中断；重新插上后在 UI 刷新设备可恢复。
 - [ ] 单声卡场景同样可用（与多声卡同一路径）。
 
@@ -195,7 +199,8 @@ sudo ls -l /vol1/@appdata/fusionplay-fnos/              # app.log、fusionplay.l
    sudo ss -lntp | grep 18080                   # 监听进程启动时间 = 刚刚
    sudo pgrep -af 'fusionplay-fnos/bin/fusionplay-fnos'   # 只有 1 个进程
    ```
-4. 配置检查：`sudo cat /vol1/@apphome/fusionplay-fnos/config.json` 中设备/校准/接收器名未丢。
+4. 配置检查：`sudo cat /vol1/@apphome/fusionplay-fnos/config.json` 中设备/校准/接收器名未丢；
+   从 0.1.x 升级时，`config_version` 应变为 `2`，旧全局 `audio.curve` 已复制到每个设备的 `curve`。
 5. 功能抽测：AirPlay/DLNA 各投放一次、设备页正常。
 6. 若升级后打不开：查看应用中心提示（`TRIM_TEMP_LOGFILE`）与
    `/vol1/@appdata/fusionplay-fnos/app.log`，必要时手动「启动」一次。

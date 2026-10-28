@@ -26,7 +26,7 @@ impl Default for CurveKind {
 }
 
 /// A monotonic volume curve over logical 0..=1.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct VolumeCurve {
     pub kind: CurveKind,
     /// Custom control points `(x, y)` in 0..=1, sorted by x, monotonic in y.
@@ -68,6 +68,13 @@ fn perceptual(kind: CurveKind, x: f32) -> f32 {
 }
 
 impl VolumeCurve {
+    /// The "neutral" curve (balanced preset, no custom points). Used to detect
+    /// un-migrated legacy configs: a device without an explicit curve still has
+    /// this value after deserialization.
+    pub fn is_default(&self) -> bool {
+        self.kind == CurveKind::Balanced && self.points.is_empty()
+    }
+
     /// Map logical sender amplitude (0..=1) to post-curve amplitude (0..=1).
     pub fn apply(&self, logical: f32) -> f32 {
         let x = logical.clamp(0.0, 1.0);

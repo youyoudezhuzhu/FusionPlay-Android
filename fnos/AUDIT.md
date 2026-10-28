@@ -77,7 +77,7 @@ Linux 端必须新增；三协议都各自内置 cpal 单设备输出，**统一
 | 跨协议仲裁 | 三协议"同一虚拟接收器同时只播一个主音源"，接管时 flush + 挂起旧协议（复用 `PlaybackArbiter` 思路） |
 | DLNA 媒体播放 | HTTP(S) 拉流 + MP3/FLAC/WAV/AAC/MP4 音频解码 → PCM（HLS/视频首版明确不支持） |
 | fnOS 宿主进程 | HTTP API（Unix socket + TCP）、静态 Web UI、状态机、诊断、配置导入导出 |
-| fnOS Web UI | 概览/协议/声卡/校准/设置诊断五页，中文、响应式 |
+| fnOS Web UI | 概览/音频/接收/设置四页，每设备独立曲线，中文、响应式、浅深色 |
 | FPK 打包与 CI | manifest/cmd 9 脚本/privilege（`join-groups: ["audio"]`）/resource/ui/icons、`build-fnos.yml` |
 
 ### 2.6 实现存在，但必须真机验证

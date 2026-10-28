@@ -123,3 +123,70 @@ errors = []
 5. 真实多声卡同时输出、长期漂移补偿效果、手动延迟校准听感。
 6. Intel N150 长时间运行 CPU/内存实测（架构按低占用设计，但未做 24h 压测）。
 7. 真实浏览器/移动端 UI 渲染（无浏览器环境，仅 jsdom）。
+
+---
+
+## 8. v0.2.0 验证记录（四页面 UI 重构 + 逐设备独立音量曲线）
+
+### 8.1 后端（配置 / 迁移 / API / 音频链路）
+
+`cargo test --manifest-path fnos/backend/Cargo.toml --all-targets`：
+
+| target | 结果 |
+|---|---|
+| lib unit（配置、迁移、音量曲线、仲裁、引擎、HTTP、日志） | **32 passed / 0 failed** |
+| `audio_alsa_smoke`（真实声卡，需手动 `--ignored`） | 0 passed / **1 ignored** |
+| `audio_engine_mock`（双设备、漂移、热插拔、缓冲、**逐设备曲线/增益/全局/静音链路**） | **7 passed / 0 failed** |
+| `dlna_decode`（流式/解码/接管） | **11 passed / 0 failed** |
+| `http_calibration`（设备级曲线 API、重启持久化、v1 导入迁移、非法曲线拒绝） | **4 passed / 0 failed** |
+
+合计 **54 passed / 0 failed / 1 ignored**。
+
+回归：`AirPlayReceiver.Core` **82 + 1** passed（含外部 PCM 钩子测试），
+`FusionPlay.MiPlaySdk` **93 passed**；Linux release 构建通过。
+
+关键断言（真实执行）：
+- 两个设备保存不同曲线互不覆盖；`GET /api/calibration` 分别返回；重启服务后仍在。
+- 旧 v1 配置（全局 `audio.curve`）加载后：`config_version=2`、全局 curve 清空、
+  每个无独立曲线的设备获得旧曲线；已有独立曲线的设备不被覆盖；迁移幂等。
+- `POST /api/import` 导入 v1 导出同样迁移（修复了此前 import 未调用 migrate 的缺陷）。
+- 引擎链路：linear 设备在 sender=100% 输出 0.5，custom(0.5) 设备输出 0.25；
+  全局 50% + 设备 −6 dB 后两者约 0.125；全局静音=0；发送端静音（gain=0）=0。
+  发送端音量只映射一次（曲线按块计算，块级增益斜坡）。
+
+### 8.2 前端（四页面 / 主题 / 草稿 / 曲线编辑）
+
+前端改为 `index.html + style.css + js/`（8 个模块，无框架/无构建/无 CDN/无外链字体/内联 SVG）。
+
+| 检查 | 结果 |
+|---|---|
+| `node --check` 8 个 JS | 全部通过 |
+| HTML 静态自检（id 引用/资源/图标/脚本） | 148 唯一 id、96 JS 引用 0 缺失、STATIC CHECK OK |
+| 真实后端 API 集成（null 音频后端，18090） | **72 / 72** |
+| jsdom DOM 集成（fnOS 网关路径 `/app/fusionplay-fnos/`） | **74 / 74**，无 window error / unhandled rejection |
+| 开发根路径冒烟（`GATEWAY_BASE` 为空） | 通过 |
+| 曲线逻辑（公式与后端一致、端点固定、拖拽/键盘/增删/重置） | **18 / 18** |
+
+覆盖：四页导航、主题三态、设备选择与启停独立、设备切换、每设备独立曲线、自定义编辑、
+草稿保存/撤销/跨页保留、离线设备、无媒体空态、断线恢复、设置页日志搜索、v1 导入兼容。
+
+未验证：真实浏览器渲染/截图、360/390/768/1024 实际布局、移动端触摸拖拽、真实发送端。
+
+### 8.3 FPK
+
+| 检查 | 结果 |
+|---|---|
+| `build-fpk.sh`（manifest/crate/binary 三方版本一致） | ✅ `0.2.0`，x86_64 |
+| `check-fpk.sh`（结构、cmd、privilege audio、licenses、前端资源 `www/js/main.js` 等） | ✅ 通过 |
+| `simulate-install.sh` | ✅ **63 / 63** |
+| `simulate-upgrade.sh`（0.2.0 → 0.2.1 临时包 + 孤儿进程） | ✅ **46 / 46** |
+
+产物：`fnos/dist/fusionplay-fnos.fpk`，sha256 见发布记录。
+
+### 8.4 未验证边界（v0.2.0 仍为真机项）
+
+1. 真实浏览器截图/像素级视觉一致性、移动端布局与触摸曲线编辑。
+2. 真实 ALSA 多音箱同时输出与逐设备曲线的**听感**、延迟/漂移校准效果。
+3. iPhone/iPad AirPlay 2、真实 DLNA 控制端、HyperOS 小米妙播的投放与音量联动。
+4. 真实 fnOS 应用中心安装/升级/卸载与 `/dev/snd` 权限。
+5. 24h 长稳、真实 XRUN 注入、多声卡拔插。

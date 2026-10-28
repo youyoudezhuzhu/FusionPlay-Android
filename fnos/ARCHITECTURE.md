@@ -14,7 +14,7 @@ MiPlay ───MiPlaySdk──┤  sink.rs ──┤            │            
                      │  dlna_player.rs（HTTP 拉流 + symphonia 解码 → PCM）                     │
                      │                        ▼                                                │
                      │   audio/（统一引擎，48k stereo f32 主混音）                             │
-                     │     volume：音量曲线 → 全局衰减 → 每设备 dB → mute                      │
+                     │     volume：每设备曲线 → 每设备 dB → 全局衰减 → mute（发送端主音量唯一来源）│
                      │     fan-out：每设备独立 ring + 重采样 + 漂移补偿 + 延迟补偿              │
                      │        ├─ ALSA hw:CARD=x,DEV=0   ├─ hdmi  ├─ 板载 ...                   │
                      │  http.rs：/healthz /api/* + 静态 UI（$TRIM_APPDEST/www）                │
@@ -80,10 +80,10 @@ pub use events::{CoreEvent, EventSink};
 | 文件 | 职责 |
 |---|---|
 | `src/main.rs` | 解析 `--config/--state-dir/--listen-tcp/--listen-unix/--version`；初始化日志；起 AudioEngine、协议宿主、HTTP；SIGTERM 收尾 |
-| `src/config.rs` | `Config { receiver, protocols{airplay,dlna,miplay}, audio{devices[], global_attenuation, curve, custom_points, mute}, calibration, logging }`；原子落盘、导入导出、默认值 |
+| `src/config.rs` | `Config { config_version, receiver, protocols{airplay,dlna,miplay}, audio{global_attenuation_percent, muted, devices[{id,name,enabled,gain_db,delay_ms,sample_rate,curve}], legacy curve}, logging }`；原子落盘、导入导出、v1→v2 幂等迁移、默认值 |
 | `src/state.rs` | 共享状态快照（`Arc<RwLock<AppState>>`）：协议状态、当前音源/媒体、发送端音量、设备状态、队列/丢帧、错误 |
 | `src/session.rs` | 三协议仲裁：`Lease { source, epoch }`；`claim()` 接管并回调旧源 suspend；只放行当前 lease 的 PCM |
-| `src/volume.rs` | `Curve::{Linear,Soft,Balanced,Custom}`、单调自定义点、`GainChain{ sender, curve, global, device_db, mute }` → 输出增益；测试 |
+| `src/volume.rs` | `Curve::{Linear,Soft,Balanced,Custom}`、单调自定义点、逐设备曲线映射 `sender_logical -> amplitude`、`device_db_to_gain`、`delay_ms_to_frames`；测试 |
 | `src/audio/mod.rs` | `DeviceInfo/DeviceSettings/EngineStatus`、`AudioEngine`（实现 `PcmOutput`）、`MockEngine`（CI 无设备） |
 | `src/audio/alsa.rs` | ALSA 枚举（`/proc/asound` + `alsa` crate 校验、稳定 ID）、每设备 worker（ring + rubato 重采样 + 漂移比例 + 延迟补偿 + dB/mute）、热插拔重扫、单设备=多设备同一路径 |
 | `src/audio/resample.rs` | 重采样/漂移比例封装（rubato），可单测 |
@@ -103,12 +103,30 @@ pub use events::{CoreEvent, EventSink};
 | `GET /api/devices` | ALSA 实测设备列表（id/name/card/device/rates/channels/default） |
 | `POST /api/devices/refresh` | 重新枚举 |
 | `POST /api/devices/test` | `{id}` 播放 1s 测试音 |
-| `PUT /api/calibration` | 全局衰减/曲线/自定义点/每设备增益/延迟 |
-| `POST /api/calibration/preview` | 曲线预览采样 |
+| `GET /api/calibration` | `{config_version, global_attenuation_percent, muted, devices[{id,name,enabled,gain_db,delay_ms,sample_rate,curve}]}` |
+| `PUT /api/calibration` | 全局衰减/静音 + 每设备 `enabled/gain_db/delay_ms/sample_rate/curve`；legacy 顶层 `curve` 会应用到全部设备（兼容 v1，不再存为全局） |
+| `POST /api/calibration/preview` | `{device_id?|curve?}` → `{device_id,curve,kind,points,samples[101]}`；可明确对应设备或其曲线数据 |
 | `GET /api/logs?lines=N` | 最近 N 行 |
 | `POST /api/logs/level` | `{level}` |
 | `GET /api/export` / `POST /api/import` | 配置导入导出 |
 | `GET /api/diagnostics` | 网络接口、ALSA 状态、进程/版本/构建信息 |
+
+### 3.2 音量模型（v2：逐设备曲线）
+
+发送端（AirPlay dB / DLNA % / MiPlay %）→ 统一逻辑音量 `sender_gain (0..=1)`，这是唯一的
+"主音量"来源，NAS 不反向改写。音频引擎对每个启用设备独立计算：
+
+```
+device_gain = device.curve.apply(sender_gain)      // 该设备自己的响应曲线
+            * device_db_to_gain(device.gain_db)     // 该设备响度平衡（-30..0 dB）
+            * global_attenuation_percent / 100      // 全局衰减
+            * (muted ? 0 : 1)                       // 全局静音
+```
+
+- 曲线按块计算一次，ring 内做块级线性增益斜坡，避免爆音；设备线程另有增益斜坡与淡入。
+- 发送端静音（`sender_gain == 0`）经任何合法曲线（首尾固定 0/0）都映射为 0，优先于本地校准。
+- 旧配置的 `audio.curve`（v1 全局曲线）在加载时复制给所有尚无独立曲线的设备，
+  然后清空并写回 `config_version=2`；迁移幂等，且不会覆盖已存在独立曲线的设备。
 
 ## 4. FPK 包（形态 B：编译二进制）
 
