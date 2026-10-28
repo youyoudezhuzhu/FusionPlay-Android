@@ -251,3 +251,42 @@ GitHub Actions（tag `fnos-v0.2.1` → commit `5a7105c`）：
 ### 9.5 仍未验证
 
 与 §8.4 相同（真实浏览器截图、真实发送端、真实多声卡听感、应用中心安装）。
+
+---
+
+## 10. v0.2.2：修复小米妙播一直显示「启动中」
+
+### 10.1 现象
+
+升级 0.2.1 后，概览与接收页的小米妙播一直停在 `starting`（启动中），
+详情为「小米妙播启动中（等待设备发现广播）」，没有后续事件纠正。
+
+### 10.2 根因
+
+`MiPlayReceiver::start()` 在**返回之前**同步发出 `receiver_ready` 事件。
+0.2.1 的 `start_miplay()` 在 `start()` 返回后又无条件写入 `starting`，
+把事件处理器刚设置的 `waiting` 覆盖掉；此后不会再有 ready 事件，
+状态永久停在启动中（0.2.0 因直接写 `running` 而未暴露）。
+
+### 10.3 修复
+
+- `start_miplay()`：先写 `starting`，再调用 `start()`；返回后不再覆盖
+  事件处理器产生的状态（仅当状态意外为空时保持 `starting`，不伪造 ready）。
+- 额外处理 `discovery_backend_failed` 事件 → `error` + 规范详情，
+  发现服务失败时不再表现为永久“启动中”。
+
+### 10.4 验证
+
+- 真实运行（本机）：为避免与已安装实例的 8899 端口冲突，测试实例绑定备用网卡
+  `zt6jyycxxo 10.144.57.86`，仅启用 MiPlay：
+
+```
+miplay  state='waiting'  detail='等待小米妙播投放'
+```
+
+  即 SDK `receiver_ready` 事件后状态正确切换为「等待投放」。
+- 后端全量：**58 passed / 0 failed / 1 ignored**（lib 36 + mock 7 + dlna 11 + http 4）；
+  core 83、MiPlay 93 回归通过；release 构建通过。
+- FPK `0.2.2` 构建与 check-fpk 通过；`simulate-install` **63/63**、
+  `simulate-upgrade` **46/46**。
+- 已安装实例（0.2.1）当前仍显示启动中，升级到 0.2.2 后即可恢复「等待投放」。

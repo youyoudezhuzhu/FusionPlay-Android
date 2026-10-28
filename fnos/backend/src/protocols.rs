@@ -394,16 +394,35 @@ impl ProtocolHosts {
         )
         .with_initial_volume_percent(50)
         .with_hardware_address(Some(mac));
+        // `MiPlayReceiver::start()` emits `receiver_ready` synchronously *before*
+        // it returns. That event sets the protocol to "waiting"; overwriting it
+        // afterwards with "starting" would leave the UI stuck on 启动中 with no
+        // later event to correct it (observed in 0.2.1). Set the transitional
+        // state first and never overwrite a state the event handler produced.
+        {
+            let mut state = self.state.state.write().unwrap();
+            if state.miplay.state != proto_state::WAITING {
+                set_proto(
+                    &mut state.miplay,
+                    proto_state::STARTING,
+                    "小米妙播启动中（等待设备发现广播）",
+                );
+            }
+        }
         let receiver = MiPlayReceiver::start(receiver_config, events)
             .context("启动小米妙播接收器失败（发现/鉴权/端口）")?;
         let controller = receiver.controller();
         {
+            // If (unexpectedly) no ready event arrived, stay in "starting"
+            // rather than faking a ready state; the UI will surface it.
             let mut state = self.state.state.write().unwrap();
-            set_proto(
-                &mut state.miplay,
-                proto_state::STARTING,
-                "小米妙播启动中（等待设备发现广播）",
-            );
+            if state.miplay.state.is_empty() {
+                set_proto(
+                    &mut state.miplay,
+                    proto_state::STARTING,
+                    "小米妙播启动中（等待设备发现广播）",
+                );
+            }
         }
         *self.miplay.lock().unwrap() = Some(MiPlayHandle { receiver, controller });
         Ok(())
@@ -677,6 +696,16 @@ fn handle_miplay_event(value: Value, state: SharedState, sink: Arc<EngineSink>) 
     let kind = value.get("event").and_then(Value::as_str).unwrap_or_default();
     let text = |key: &str| value.get(key).and_then(Value::as_str).map(|v| v.to_string());
     match kind {
+        "discovery_backend_failed" => {
+            let mut runtime = state.state.write().unwrap();
+            if runtime.miplay.enabled {
+                set_proto(
+                    &mut runtime.miplay,
+                    proto_state::ERROR,
+                    "小米妙播发现服务启动失败（详见诊断日志）",
+                );
+            }
+        }
         "receiver_ready" | "discovery_backend_ready" => {
             let mut runtime = state.state.write().unwrap();
             if runtime.miplay.enabled {

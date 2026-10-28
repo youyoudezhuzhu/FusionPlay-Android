@@ -1,6 +1,6 @@
 # FusionPlay fnOS 管理界面：v2 结构与交互说明
 
-> 当前实现版本：`0.2.1`。代码：`fnos/frontend/`（纯 HTML/CSS/原生 JS，无框架、无构建、无 CDN）。
+> 当前实现版本：`0.2.2`。代码：`fnos/frontend/`（纯 HTML/CSS/原生 JS，无框架、无构建、无 CDN）。
 > 后端 API 契约见 `fnos/ARCHITECTURE.md`；验证记录见 `fnos/VERIFICATION.md`。
 > 本文描述 **v2 四页面** 的信息架构、交互与数据绑定；旧版五页面/全局曲线文档已废弃。
 

@@ -728,7 +728,7 @@ dependencies = [
 
 [[package]]
 name = "fusionplay-fnos"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "airplay-receiver-core",
  "alsa 0.9.1",

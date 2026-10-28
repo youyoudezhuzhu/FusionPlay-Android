@@ -5,7 +5,7 @@
 #   - source 第三方固定 thirdparty
 # 本包内含 x86_64 ELF（fnos/backend release 构建），因此 platform = x86；ARM 版需交叉编译后再出包。
 appname               = fusionplay-fnos
-version               = 0.2.1
+version               = 0.2.2
 display_name          = "FusionPlay"
 desc                  = "把 AirPlay 2 / DLNA / 小米妙播音频接到飞牛 NAS 的音频输出设备（多声卡、发送端主音量、校准）"
 source                = thirdparty
@@ -14,7 +14,7 @@ maintainer            = "youyoudezhuzhu"
 maintainer_url        = https://github.com/youyoudezhuzhu/FusionPlay-Android
 distributor           = "youyoudezhuzhu"
 distributor_url       = https://github.com/youyoudezhuzhu/FusionPlay-Android
-changelog             = "0.2.1：统一三协议状态文案（等待投放/播放中/已暂停/已关闭/异常），概览与接收页完全同步；0.2.0：四页面浅色/深色 UI 重构；每设备独立音量曲线、响度与延迟；全局仅保留衰减/静音；v1 配置自动迁移"
+changelog             = "0.2.2：修复小米妙播一直显示「启动中」；0.2.1：统一三协议状态文案（等待投放/播放中/已暂停/已关闭/异常），概览与接收页完全同步；0.2.0：四页面浅色/深色 UI 重构；每设备独立音量曲线、响度与延迟；全局仅保留衰减/静音；v1 配置自动迁移"
 desktop_uidir         = ui
 desktop_applaunchname = fusionplay-fnos.main
 service_port          = 18080
