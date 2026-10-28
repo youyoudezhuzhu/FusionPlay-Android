@@ -290,12 +290,20 @@ window.FP = window.FP || {};
     { key: 'miplay', label: '小米妙播', icon: 'miplay', desc: '小米 / 妙播协议，HyperOS 设备投放' }
   ];
 
+  // Canonical protocol states (see fnos/backend/src/protocols.rs). The backend
+  // uses one vocabulary for AirPlay/DLNA/MiPlay, and legacy aliases are mapped
+  // here as a defensive fallback so the overview and receive page can never
+  // show different words for the same state (e.g. 就绪/监听中/运行中).
   const STATE_LABELS = {
-    running: '运行中', listening: '监听中', playing: '播放中', streaming: '串流中',
-    paused: '已暂停', loading: '加载中', buffering: '缓冲中', idle: '空闲',
-    starting: '启动中', stopping: '停止中', stopped: '已停止', connecting: '连接中',
-    reconnecting: '重连中', connected: '已连接', disconnected: '已断开', ready: '就绪',
-    waiting: '等待中', offline: '离线', disabled: '已停用', error: '异常', failed: '异常'
+    waiting: '等待投放', ready: '等待投放', listening: '等待投放',
+    running: '等待投放', idle: '等待投放',
+    starting: '启动中', loading: '加载中', buffering: '加载中',
+    connecting: '启动中', reconnecting: '启动中',
+    streaming: '播放中', playing: '播放中', active: '播放中',
+    paused: '已暂停',
+    stopping: '正在停止', stopped: '已关闭', disabled: '已关闭',
+    offline: '未连接', disconnected: '未连接', connected: '已连接',
+    error: '异常', failed: '异常'
   };
 
   const CURVE_LABELS = { linear: '线性', soft: '柔和', balanced: '均衡', custom: '自定义' };
@@ -313,10 +321,11 @@ window.FP = window.FP || {};
 
   function stateTone(state) {
     switch (state) {
-      case 'running': case 'listening': case 'playing': case 'streaming':
-      case 'connected': case 'ready': return 'ok';
+      case 'waiting': case 'ready': case 'listening': case 'running':
+      case 'idle': case 'streaming': case 'playing': case 'active':
+        return 'ok';
+      case 'paused': return 'warn';
       case 'error': case 'failed': return 'danger';
-      case 'offline': case 'disconnected': return 'warn';
       default: return 'neutral';
     }
   }

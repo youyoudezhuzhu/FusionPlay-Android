@@ -31,7 +31,37 @@ use crate::audio::AudioEngine;
 use crate::config::Config;
 use crate::dlna_player::DlnaPlayer;
 use crate::session::{Arbiter, Lease, Source, SuspendHook};
-use crate::state::SharedState;
+use crate::state::{ProtocolRuntime, SharedState};
+
+/// Canonical protocol states shared by all three protocols and the Web UI.
+/// Keeping one vocabulary prevents "就绪 / 监听中 / 运行中" style drift between
+/// the overview and the receive page: both read the same backend state.
+mod proto_state {
+    pub const DISABLED: &str = "disabled";
+    pub const STARTING: &str = "starting";
+    pub const WAITING: &str = "waiting";
+    pub const LOADING: &str = "loading";
+    pub const STREAMING: &str = "streaming";
+    pub const PAUSED: &str = "paused";
+    pub const ERROR: &str = "error";
+}
+
+fn set_proto(runtime: &mut ProtocolRuntime, state: &str, detail: impl Into<String>) {
+    runtime.state = state.to_string();
+    runtime.detail = detail.into();
+}
+
+/// Map a core lifecycle status to the canonical AirPlay state.
+fn airplay_core_state(core_state: &str) -> Option<(&'static str, &'static str)> {
+    match core_state {
+        "starting" => Some((proto_state::STARTING, "AirPlay 2 接收器启动中")),
+        "ready" | "waiting" | "listening" => Some((proto_state::WAITING, "等待 AirPlay 2 投放")),
+        "streaming" | "playing" => Some((proto_state::STREAMING, "正在播放 AirPlay 2 音频")),
+        "paused" => Some((proto_state::PAUSED, "AirPlay 2 已暂停")),
+        "error" | "failed" => Some((proto_state::ERROR, "AirPlay 2 接收异常（详见日志）")),
+        _ => None,
+    }
+}
 
 /// Shared PCM sink: claims the source on first block and gates PCM to the
 /// engine through the arbiter.
@@ -239,9 +269,30 @@ impl ProtocolHosts {
     fn apply(&self, config: &Config) -> Result<()> {
         self.stop_hosts();
         let state_dir = state_dir();
-        self.state.state.write().unwrap().airplay.enabled = config.protocols.airplay.enabled;
-        self.state.state.write().unwrap().dlna.enabled = config.protocols.dlna.enabled;
-        self.state.state.write().unwrap().miplay.enabled = config.protocols.miplay.enabled;
+        {
+            let mut state = self.state.state.write().unwrap();
+            let airplay = config.protocols.airplay.enabled;
+            let dlna = config.protocols.dlna.enabled;
+            let miplay = config.protocols.miplay.enabled;
+            state.airplay.enabled = airplay;
+            state.dlna.enabled = dlna;
+            state.miplay.enabled = miplay;
+            if airplay {
+                set_proto(&mut state.airplay, proto_state::STARTING, "AirPlay 2 接收器启动中");
+            } else {
+                set_proto(&mut state.airplay, proto_state::DISABLED, "已在设置中关闭");
+            }
+            if dlna {
+                set_proto(&mut state.dlna, proto_state::STARTING, "DLNA 接收器启动中");
+            } else {
+                set_proto(&mut state.dlna, proto_state::DISABLED, "已在设置中关闭");
+            }
+            if miplay {
+                set_proto(&mut state.miplay, proto_state::STARTING, "小米妙播启动中");
+            } else {
+                set_proto(&mut state.miplay, proto_state::DISABLED, "已在设置中关闭");
+            }
+        }
 
         if config.protocols.airplay.enabled || config.protocols.dlna.enabled {
             self.start_core(config, &state_dir)?;
@@ -348,8 +399,11 @@ impl ProtocolHosts {
         let controller = receiver.controller();
         {
             let mut state = self.state.state.write().unwrap();
-            state.miplay.state = "running".into();
-            state.miplay.detail = format!("广播名称 {}", config.receiver.name);
+            set_proto(
+                &mut state.miplay,
+                proto_state::STARTING,
+                "小米妙播启动中（等待设备发现广播）",
+            );
         }
         *self.miplay.lock().unwrap() = Some(MiPlayHandle { receiver, controller });
         Ok(())
@@ -480,26 +534,20 @@ fn handle_core_event(json: String, state: SharedState, dlna: Arc<DlnaPlayer>) {
     match kind {
         "receiver_ready" => {
             let mut runtime = state.state.write().unwrap();
-            runtime.airplay.state = "listening".into();
-            runtime.airplay.port = value.get("port").and_then(Value::as_u64).unwrap_or(0) as u16;
-            runtime.airplay.detail = format!(
-                "名称 {} · 设备 {}",
-                text("name").unwrap_or_default(),
-                text("device_id").unwrap_or_default()
-            );
-            runtime.dlna.state = if value.get("port").and_then(Value::as_u64).unwrap_or(0) > 0 {
-                "listening".into()
-            } else {
-                "idle".into()
-            };
+            if runtime.airplay.enabled {
+                runtime.airplay.port =
+                    value.get("port").and_then(Value::as_u64).unwrap_or(0) as u16;
+                set_proto(&mut runtime.airplay, proto_state::WAITING, "等待 AirPlay 2 投放");
+            }
         }
         "status" => {
             let mut runtime = state.state.write().unwrap();
-            if let Some(value) = text("state") {
-                runtime.airplay.state = value;
-            }
-            if let Some(message) = text("message") {
-                runtime.airplay.detail = message;
+            if runtime.airplay.enabled {
+                if let Some(core_state) = text("state") {
+                    if let Some((state, detail)) = airplay_core_state(&core_state) {
+                        set_proto(&mut runtime.airplay, state, detail);
+                    }
+                }
             }
         }
         "now_playing" => {
@@ -525,17 +573,21 @@ fn handle_core_event(json: String, state: SharedState, dlna: Arc<DlnaPlayer>) {
             let mut runtime = state.state.write().unwrap();
             let source = text("source").unwrap_or_default();
             if source == "dlna" {
-                runtime.dlna.state = "playing".into();
-            } else {
-                runtime.airplay.state = "streaming".into();
+                if runtime.dlna.enabled {
+                    set_proto(&mut runtime.dlna, proto_state::STREAMING, "正在播放 DLNA 音频");
+                }
+            } else if runtime.airplay.enabled {
+                set_proto(&mut runtime.airplay, proto_state::STREAMING, "正在播放 AirPlay 2 音频");
             }
         }
         "stream_stopped" => {
             let mut runtime = state.state.write().unwrap();
             if text("source").as_deref() == Some("dlna") {
-                runtime.dlna.state = "idle".into();
-            } else {
-                runtime.airplay.state = "listening".into();
+                if runtime.dlna.enabled {
+                    set_proto(&mut runtime.dlna, proto_state::WAITING, "等待 DLNA 投放");
+                }
+            } else if runtime.airplay.enabled {
+                set_proto(&mut runtime.airplay, proto_state::WAITING, "等待 AirPlay 2 投放");
             }
         }
         "client_connected" => {
@@ -547,16 +599,18 @@ fn handle_core_event(json: String, state: SharedState, dlna: Arc<DlnaPlayer>) {
         }
         "dlna_ready" => {
             let mut runtime = state.state.write().unwrap();
-            runtime.dlna.state = "listening".into();
-            runtime.dlna.port = value.get("port").and_then(Value::as_u64).unwrap_or(0) as u16;
-            runtime.dlna.detail = text("friendly_name").unwrap_or_default();
+            if runtime.dlna.enabled {
+                runtime.dlna.port = value.get("port").and_then(Value::as_u64).unwrap_or(0) as u16;
+                set_proto(&mut runtime.dlna, proto_state::WAITING, "等待 DLNA 投放");
+            }
         }
         "dlna_media" => {
             let Some(url) = text("url") else { return };
             {
                 let mut runtime = state.state.write().unwrap();
-                runtime.dlna.state = "loading".into();
-                runtime.dlna.detail = format!("拉取媒体：{url}");
+                if runtime.dlna.enabled {
+                    set_proto(&mut runtime.dlna, proto_state::LOADING, "正在加载 DLNA 媒体");
+                }
                 runtime.media.title = text("title");
                 runtime.media.artist = text("artist");
                 runtime.media.album = text("album");
@@ -573,7 +627,13 @@ fn handle_core_event(json: String, state: SharedState, dlna: Arc<DlnaPlayer>) {
                         tracing::error!("{message}");
                         state.record_error(message);
                         let mut runtime = state.state.write().unwrap();
-                        runtime.dlna.state = "error".into();
+                        if runtime.dlna.enabled {
+                            set_proto(
+                                &mut runtime.dlna,
+                                proto_state::ERROR,
+                                "DLNA 播放失败（详见诊断日志）",
+                            );
+                        }
                     }
                 })
                 .ok();
@@ -586,7 +646,9 @@ fn handle_core_event(json: String, state: SharedState, dlna: Arc<DlnaPlayer>) {
         "dlna_stop" => {
             dlna.stop();
             let mut runtime = state.state.write().unwrap();
-            runtime.dlna.state = "listening".into();
+            if runtime.dlna.enabled {
+                set_proto(&mut runtime.dlna, proto_state::WAITING, "等待 DLNA 投放");
+            }
         }
         "dlna_seek" => {
             let mut runtime = state.state.write().unwrap();
@@ -617,31 +679,22 @@ fn handle_miplay_event(value: Value, state: SharedState, sink: Arc<EngineSink>) 
     match kind {
         "receiver_ready" | "discovery_backend_ready" => {
             let mut runtime = state.state.write().unwrap();
-            runtime.miplay.state = "listening".into();
-            runtime.miplay.detail = format!(
-                "{}:{} · {}",
-                text("address").unwrap_or_default(),
-                value.get("port").and_then(Value::as_u64).unwrap_or(0),
-                text("name").unwrap_or_default()
-            );
+            if runtime.miplay.enabled {
+                set_proto(&mut runtime.miplay, proto_state::WAITING, "等待小米妙播投放");
+            }
         }
         "stream_started" => {
             let mut runtime = state.state.write().unwrap();
-            runtime.miplay.state = "streaming".into();
+            runtime.miplay.state = proto_state::STREAMING.to_string();
+            runtime.miplay.detail = "正在播放小米妙播音频".to_string();
             runtime.current_source = Some("miplay".into());
             runtime.media.title = text("title");
             runtime.media.artist = text("artist");
             runtime.media.album = text("album");
-            runtime.miplay.detail = format!(
-                "{} Hz · {} 声道",
-                value.get("sample_rate").and_then(Value::as_u64).unwrap_or(0),
-                value.get("channels").and_then(Value::as_u64).unwrap_or(0)
-            );
         }
         "stream_stopped" | "media_channel_closed" | "media_session_replaced" => {
             let mut runtime = state.state.write().unwrap();
-            runtime.miplay.state = "listening".into();
-            runtime.miplay.detail = "等待妙播投放".into();
+            set_proto(&mut runtime.miplay, proto_state::WAITING, "等待小米妙播投放");
             if runtime.current_source.as_deref() == Some("miplay") {
                 runtime.current_source = None;
             }
@@ -650,15 +703,19 @@ fn handle_miplay_event(value: Value, state: SharedState, sink: Arc<EngineSink>) 
         "playback_state" => {
             if let Some(playing) = value.get("playing").and_then(Value::as_bool) {
                 let mut runtime = state.state.write().unwrap();
-                runtime.miplay.state = if playing { "streaming".into() } else { "paused".into() };
+                if runtime.miplay.enabled {
+                    if playing {
+                        set_proto(&mut runtime.miplay, proto_state::STREAMING, "正在播放小米妙播音频");
+                    } else {
+                        set_proto(&mut runtime.miplay, proto_state::PAUSED, "小米妙播已暂停");
+                    }
+                }
             }
         }
         "audio_output_ready" => {
-            let mut runtime = state.state.write().unwrap();
-            runtime.miplay.detail = format!(
-                "统一音频引擎 · {}",
-                text("device_name").unwrap_or_default()
-            );
+            // Audio-engine readiness must not replace the user-facing protocol
+            // status text; it is logged for diagnostics only.
+            tracing::info!("小米妙播统一音频引擎就绪");
         }
         "audio_format" => {
             let mut runtime = state.state.write().unwrap();
@@ -670,7 +727,9 @@ fn handle_miplay_event(value: Value, state: SharedState, sink: Arc<EngineSink>) 
             let message = text("message").unwrap_or_else(|| "妙播错误".into());
             state.record_error(message);
             let mut runtime = state.state.write().unwrap();
-            runtime.miplay.state = "error".into();
+            if runtime.miplay.enabled {
+                set_proto(&mut runtime.miplay, proto_state::ERROR, "小米妙播异常（详见诊断日志）");
+            }
         }
         "warning" => {
             if let Some(message) = text("message") {
@@ -703,5 +762,116 @@ pub fn core_event_kind(event: &CoreEvent<'_>) -> &'static str {
         CoreEvent::ReceiverReady { .. } => "receiver_ready",
         CoreEvent::DlnaMedia { .. } => "dlna_media",
         _ => "other",
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn core_lifecycle_states_map_to_one_vocabulary() {
+        let waiting = airplay_core_state("ready").unwrap();
+        assert_eq!(waiting, (proto_state::WAITING, "等待 AirPlay 2 投放"));
+        assert_eq!(airplay_core_state("listening"), Some(waiting));
+        assert_eq!(
+            airplay_core_state("streaming"),
+            Some((proto_state::STREAMING, "正在播放 AirPlay 2 音频"))
+        );
+        assert_eq!(
+            airplay_core_state("paused"),
+            Some((proto_state::PAUSED, "AirPlay 2 已暂停"))
+        );
+        assert_eq!(
+            airplay_core_state("error").map(|(state, _)| state),
+            Some(proto_state::ERROR)
+        );
+        assert_eq!(airplay_core_state("unknown-state"), None);
+    }
+
+    #[test]
+    fn core_events_produce_canonical_airplay_and_dlna_states() {
+        use crate::audio::NullBackend;
+        use crate::config::AudioSettings;
+        use serde_json::json;
+
+        let engine = AudioEngine::new(AudioSettings::default(), NullBackend::new()).unwrap();
+        let arbiter = Arc::new(Arbiter::new());
+        let state = crate::state::AppState::new();
+        {
+            let mut runtime = state.state.write().unwrap();
+            runtime.airplay.enabled = true;
+            runtime.dlna.enabled = true;
+        }
+        let dlna = DlnaPlayer::new(Arc::clone(&engine), Arc::clone(&arbiter), Arc::clone(&state));
+        let sink = EngineSink::new(Arc::clone(&engine), arbiter, Arc::clone(&state));
+        let _ = &sink;
+
+        handle_core_event(
+            json!({"type":"receiver_ready","name":"FusionPlay","port":5000,"device_id":"AA:BB"}).to_string(),
+            Arc::clone(&state),
+            Arc::clone(&dlna),
+        );
+        {
+            let runtime = state.snapshot();
+            assert_eq!(runtime.airplay.state, "waiting");
+            assert_eq!(runtime.airplay.detail, "等待 AirPlay 2 投放");
+        }
+        handle_core_event(
+            json!({"type":"dlna_ready","friendly_name":"FusionPlay","port":34653}).to_string(),
+            Arc::clone(&state),
+            Arc::clone(&dlna),
+        );
+        {
+            let runtime = state.snapshot();
+            assert_eq!(runtime.dlna.state, "waiting");
+            assert_eq!(runtime.dlna.detail, "等待 DLNA 投放");
+        }
+        handle_core_event(
+            json!({"type":"stream_started","source":"airplay","epoch":1}).to_string(),
+            Arc::clone(&state),
+            Arc::clone(&dlna),
+        );
+        assert_eq!(state.snapshot().airplay.state, "streaming");
+        handle_core_event(
+            json!({"type":"stream_stopped","source":"airplay","epoch":1}).to_string(),
+            Arc::clone(&state),
+            Arc::clone(&dlna),
+        );
+        let runtime = state.snapshot();
+        assert_eq!(runtime.airplay.state, "waiting");
+        assert_eq!(runtime.airplay.detail, "等待 AirPlay 2 投放");
+    }
+
+    #[test]
+    fn miplay_ready_event_uses_the_same_waiting_vocabulary() {
+        use crate::audio::NullBackend;
+        use crate::config::AudioSettings;
+        use serde_json::json;
+
+        let engine = AudioEngine::new(AudioSettings::default(), NullBackend::new()).unwrap();
+        let arbiter = Arc::new(Arbiter::new());
+        let state = crate::state::AppState::new();
+        state.state.write().unwrap().miplay.enabled = true;
+        let sink = EngineSink::new(engine, arbiter, state.clone());
+        handle_miplay_event(
+            json!({"event":"receiver_ready","name":"FusionPlay","address":"192.168.31.50","port":8899}),
+            Arc::clone(&state),
+            sink,
+        );
+        let runtime = state.snapshot();
+        assert_eq!(runtime.miplay.state, "waiting");
+        assert_eq!(runtime.miplay.detail, "等待小米妙播投放");
+    }
+
+    #[test]
+    fn set_proto_keeps_state_and_detail_together() {
+        let mut runtime = ProtocolRuntime::default();
+        set_proto(&mut runtime, proto_state::WAITING, "等待 DLNA 投放");
+        assert_eq!(runtime.state, "waiting");
+        assert_eq!(runtime.detail, "等待 DLNA 投放");
+        set_proto(&mut runtime, proto_state::DISABLED, "已在设置中关闭");
+        assert_eq!(runtime.state, "disabled");
     }
 }

@@ -201,3 +201,41 @@ CI 云端构建（GitHub Actions，tag `fnos-v0.2.0` → commit `4904c2b`）：
 3. iPhone/iPad AirPlay 2、真实 DLNA 控制端、HyperOS 小米妙播的投放与音量联动。
 4. 真实 fnOS 应用中心安装/升级/卸载与 `/dev/snd` 权限。
 5. 24h 长稳、真实 XRUN 注入、多声卡拔插。
+
+---
+
+## 9. v0.2.1：三协议状态文案统一
+
+### 9.1 问题
+
+概览与「接收」页显示三套同义状态：AirPlay `就绪`、DLNA `监听中`、小米妙播 `运行中`，
+且 AirPlay 详情还是 core 的合并文案「等待 AirPlay 2 或 DLNA 投放」。根因有两处：
+core 的 `status` 事件把 `ready` 原样写入 AirPlay 状态；MiPlay 启动后直接写 `running`；
+前端对 `ready/listening/running` 分别映射了不同中文。
+
+### 9.2 修复
+
+- 后端引入统一状态词表并归一化 `protocols.rs`（三协议共用）：
+  `disabled / starting / waiting / loading / streaming / paused / error`；
+  每个协议维护自己的规范详情（如「等待 AirPlay 2 投放」「等待 DLNA 投放」「等待小米妙播投放」）。
+  core 的 `ready/listening/running` 一律归一为 `waiting`，不再污染 AirPlay 状态。
+- 前端 `js/core.js` 使用同一词表，并保留旧别名兜底（`ready/listening/running/idle → 等待投放`），
+  `stateTone` 同步（等待/播放为正常，暂停为警告，异常为错误，关闭为中性）。
+- 概览协议卡与接收页协议行都调用同一个 `stateLabel/stateTone`，详情都读同一个 `runtime.detail`；
+  接收页行在切到该路由时用同一数据渲染。
+
+### 9.3 验证
+
+- 后端：`cargo test --manifest-path fnos/backend/Cargo.toml --all-targets`
+  **58 passed / 0 failed / 1 ignored**（lib 36 + mock 7 + dlna 11 + http 4）。
+  新增事件级测试：`receiver_ready`/`dlna_ready`/`stream_started`/`stream_stopped` 输出
+  `waiting`/`streaming` 与规范详情；MiPlay `receiver_ready` 输出 `waiting` + 「等待小米妙播投放」。
+- 前端：静态检查 OK；真实后端 API **72/72**；jsdom DOM **74/74**；曲线逻辑 **18/18**。
+- 页面同步实测（jsdom + 真实后端，网关路径）：概览与接收页同一协议显示完全相同的状态文案
+  （示例：`{"AirPlay 2":"等待投放","DLNA":"等待投放","小米妙播":"异常"}`，
+  MiPlay 异常是因为该测试机 8899 端口被已安装实例占用；单实例下为「等待投放」）。
+- FPK：`0.2.1` 构建与 check-fpk 通过；`simulate-install` **63/63**、`simulate-upgrade` **46/46**。
+
+### 9.4 仍未验证
+
+与 §8.4 相同（真实浏览器截图、真实发送端、真实多声卡听感、应用中心安装）。

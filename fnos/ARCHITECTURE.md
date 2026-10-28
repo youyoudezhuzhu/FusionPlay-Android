@@ -128,6 +128,24 @@ device_gain = device.curve.apply(sender_gain)      // 该设备自己的响应�
 - 旧配置的 `audio.curve`（v1 全局曲线）在加载时复制给所有尚无独立曲线的设备，
   然后清空并写回 `config_version=2`；迁移幂等，且不会覆盖已存在独立曲线的设备。
 
+### 3.3 协议运行状态词表（三协议 + 两个页面共用）
+
+后端只输出以下规范状态，`/api/status.protocols.*.state` 与 Web UI 的概览/接收页共用同一词表，
+不允许再出现 `ready/listening/running` 三套同义状态：
+
+| state | UI 文案 | 含义 |
+|---|---|---|
+| `disabled` | 已关闭 | 协议在设置中关闭 |
+| `starting` | 启动中 | 协议宿主正在启动 |
+| `waiting` | 等待投放 | 接收服务就绪，等待发送端投放（空闲态） |
+| `loading` | 加载中 | DLNA 媒体正在拉流/探测 |
+| `streaming` | 播放中 | 正在播放该协议音频 |
+| `paused` | 已暂停 | 发送端暂停 |
+| `error` | 异常 | 协议启动/播放失败（详情见诊断） |
+
+每个协议同时提供一句规范 `detail`（如「等待 AirPlay 2 投放」「等待 DLNA 投放」「等待小米妙播投放」），
+概览协议卡与接收页展开详情读同一字段。
+
 ## 4. FPK 包（形态 B：编译二进制）
 
 ```
