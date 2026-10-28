@@ -1,0 +1,8 @@
+{
+    "defaults": {
+        "run-as": "package"
+    },
+    "username": "fusionplay-fnos",
+    "groupname": "fusionplay-fnos",
+    "join-groups": ["audio"]
+}

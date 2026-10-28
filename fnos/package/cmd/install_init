@@ -1,0 +1,3 @@
+#!/bin/bash
+# 安装初始化：必须保持空操作（此时 TRIM_PKGVAR 往往还没建好，mkdir 会 permission denied）
+exit 0

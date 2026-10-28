@@ -1,0 +1,14 @@
+{
+    ".url": {
+        "fusionplay-fnos.main": {
+            "title": "FusionPlay",
+            "icon": "images/icon_{0}.png",
+            "type": "iframe",
+            "protocol": "",
+            "gatewayPrefix": "/app/fusionplay-fnos",
+            "gatewaySocket": "fusionplay-fnos.sock",
+            "url": "/app/fusionplay-fnos",
+            "allUsers": true
+        }
+    }
+}

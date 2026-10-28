@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FusionPlay · 飞牛</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <div class="brand"><span class="logo">▶</span><h1>FusionPlay</h1><span class="sub">AirPlay 2 · DLNA · 小米妙播</span></div>
+  <div class="head-right"><span id="health" class="dot"></span><span id="health-text">连接中…</span><span id="version" class="pill">v?</span></div>
+</header>
+
+<main>
+  <section class="grid">
+    <article class="card">
+      <div class="card-head"><h2>概览</h2><span id="source-badge" class="badge">空闲</span></div>
+      <div class="kv">
+        <div><span>当前音源</span><b id="ov-source">—</b></div>
+        <div><span>媒体</span><b id="ov-title">—</b></div>
+        <div><span>采样</span><b id="ov-frames">—</b></div>
+        <div><span>发送端音量</span><b id="ov-volume">—</b></div>
+        <div><span>输出设备</span><b id="ov-devices">—</b></div>
+        <div><span>运行时间</span><b id="ov-uptime">—</b></div>
+      </div>
+      <div id="errors" class="errors hidden"></div>
+    </article>
+
+    <article class="card">
+      <div class="card-head"><h2>接收协议</h2><span class="badge" id="protos-badge">—</span></div>
+      <table class="table">
+        <thead><tr><th>协议</th><th>开关</th><th>状态</th><th>详情</th></tr></thead>
+        <tbody id="protocols"><tr><td colspan="4" class="muted">加载中…</td></tr></tbody>
+      </table>
+      <p class="hint">三种协议同一时刻只播放一个主音源，新音源会接管旧音源（旧会话被挂起，不混音）。</p>
+    </article>
+  </section>
+
+  <section class="card">
+    <div class="card-head"><h2>音频输出</h2><div class="head-actions">
+      <button id="refresh-devices" class="btn small">刷新设备</button>
+      <button id="save-audio" class="btn small primary">保存并应用</button>
+    </div></div>
+    <table class="table">
+      <thead><tr><th>启用</th><th>设备</th><th>稳定 ID</th><th>在线</th><th>格式</th><th>缓冲</th><th>漂移</th><th>响度(dB)</th><th>延迟(ms)</th><th>测试</th></tr></thead>
+      <tbody id="devices"><tr><td colspan="10" class="muted">加载中…</td></tr></tbody>
+    </table>
+    <p class="hint">多设备播放同一接收音源；每设备独立缓冲/重采样/漂移补偿。响度范围 −30–0 dB（不提供正增益以避免削波）。</p>
+  </section>
+
+  <section class="grid">
+    <article class="card">
+      <div class="card-head"><h2>音频校准</h2><span class="badge" id="cal-mode">发送端主音量</span></div>
+      <p class="hint">以下参数只做输出校准，<b>不会改写发送端显示的主音量</b>。</p>
+      <label class="field"><span>全局输出衰减 <b id="gain-label">100%</b></span>
+        <input type="range" id="global-gain" min="0" max="100" value="100"></label>
+      <label class="field"><span>音量曲线</span>
+        <select id="curve-kind">
+          <option value="linear">线性</option>
+          <option value="soft">柔和</option>
+          <option value="balanced">均衡（默认）</option>
+          <option value="custom">自定义</option>
+        </select></label>
+      <label class="field"><span>自定义控制点（x,y;x,y，0–1，单调）</span>
+        <input id="curve-points" placeholder="0.25,0.15;0.5,0.4;0.75,0.7"></label>
+      <label class="row-inline"><input type="checkbox" id="muted"> 静音输出（发送端仍显示自己的音量）</label>
+      <div class="row"><button id="apply-cal" class="btn primary">应用校准</button><button id="reset-cal" class="btn">恢复默认</button></div>
+      <canvas id="preview" width="480" height="160"></canvas>
+    </article>
+
+    <article class="card">
+      <div class="card-head"><h2>诊断</h2><div class="head-actions">
+        <select id="log-level"><option>error</option><option>warn</option><option selected>info</option><option>debug</option><option>trace</option></select>
+        <button id="load-diag" class="btn small">刷新</button>
+      </div></div>
+      <div class="kv small">
+        <div><span>音频后端</span><b id="diag-backend">—</b></div>
+        <div><span>网卡</span><b id="diag-ifaces">—</b></div>
+        <div><span>日志文件</span><b id="diag-logpath" class="mono">—</b></div>
+        <div><span>版本</span><b id="diag-version">—</b></div>
+      </div>
+      <pre id="logs" class="logs">加载中…</pre>
+    </article>
+  </section>
+
+  <p class="footer">FusionPlay fnOS · 发送端为主音量，NAS 仅做输出校准 · 参数仅供参考，真机验证项见仓库 AUDIT.md</p>
+</main>
+<script src="app.js"></script>
+</body>
+</html>

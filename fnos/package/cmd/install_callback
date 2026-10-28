@@ -1,0 +1,11 @@
+#!/bin/bash
+APP="${TRIM_APPDEST:-/var/apps/fusionplay-fnos/target}"
+VAR="${TRIM_PKGVAR:-/vol1/@appdata/fusionplay-fnos}"
+PKGHOME="${TRIM_PKGHOME:-/vol1/@apphome/fusionplay-fnos}"
+export HOME="$PKGHOME"
+export DATA_LIBRARY_PATH="${DATA_LIBRARY_PATH:-$VAR}"
+mkdir -p "$VAR" "$PKGHOME" 2>/dev/null || true
+chmod +x "$APP/bin/"* 2>/dev/null || true
+echo "$(date '+%F %T') install_callback ok var=$VAR home=$PKGHOME" >> "$VAR/app.log" 2>/dev/null || true
+"$APP/cmd/main" start >/dev/null 2>&1 || true
+exit 0

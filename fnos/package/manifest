@@ -1,0 +1,16 @@
+appname               = fusionplay-fnos
+version               = 0.1.0
+display_name          = "FusionPlay"
+desc                  = "把 AirPlay 2 / DLNA / 小米妙播音频接到飞牛 NAS 的音频输出设备（多声卡、发送端主音量、校准）"
+source                = thirdparty
+platform              = all
+maintainer            = "youyoudezhuzhu"
+maintainer_url        = https://github.com/youyoudezhuzhu/FusionPlay-Android
+distributor           = "youyoudezhuzhu"
+desktop_uidir         = ui
+desktop_applaunchname = fusionplay-fnos.main
+service_port          = 18080
+checkport             = true
+ctl_stop              = true
+disable_authorization_path = true
+os_min_version        = 1.0.0

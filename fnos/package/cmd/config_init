@@ -1,0 +1,5 @@
+#!/bin/bash
+VAR="${TRIM_PKGVAR:-/vol1/@appdata/fusionplay-fnos}"
+PKGHOME="${TRIM_PKGHOME:-/vol1/@apphome/fusionplay-fnos}"
+mkdir -p "$VAR" "$PKGHOME" 2>/dev/null || true
+exit 0

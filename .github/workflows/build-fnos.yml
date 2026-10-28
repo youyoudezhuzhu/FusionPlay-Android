@@ -1,0 +1,67 @@
+name: Build fnOS FPK
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'fnos-*'
+
+jobs:
+  build-fnos:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install ALSA build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libasound2-dev pkg-config tar
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            fnos/backend/target
+            src/AirPlayReceiver.Core/target
+          key: ${{ runner.os }}-fnos-cargo-${{ hashFiles('fnos/backend/Cargo.toml', 'src/AirPlayReceiver.Core/Cargo.toml', 'src/FusionPlay.MiPlaySdk/Cargo.toml', 'vendor/shairplay/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-fnos-cargo-
+
+      - name: Backend unit tests (mock audio, no hardware)
+        run: cargo test --manifest-path fnos/backend/Cargo.toml --all-targets
+
+      - name: Protocol core tests (AirPlay 2 / DLNA / MiPlay reuse)
+        run: |
+          cargo test --manifest-path src/AirPlayReceiver.Core/Cargo.toml --lib
+          cargo test --manifest-path src/FusionPlay.MiPlaySdk/Cargo.toml --lib
+
+      - name: Build release binary
+        run: cargo build --release --manifest-path fnos/backend/Cargo.toml
+
+      - name: Package FPK
+        run: |
+          chmod +x fnos/tools/fnpack-linux-amd64
+          ./fnos/tools/build-fpk.sh
+
+      - name: Verify FPK structure
+        run: ./fnos/tools/check-fpk.sh fnos/dist/fusionplay-fnos.fpk
+
+      - name: Upload FPK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: fusionplay-fnos-fpk
+          path: fnos/dist/*.fpk
+          if-no-files-found: error
+
+      - name: Attach FPK to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: fnos/dist/*.fpk

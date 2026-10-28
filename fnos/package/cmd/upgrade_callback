@@ -1,0 +1,5 @@
+#!/bin/bash
+APP="${TRIM_APPDEST:-/var/apps/fusionplay-fnos/target}"
+chmod +x "$APP/bin/"* 2>/dev/null || true
+"$APP/cmd/main" start >/dev/null 2>&1 || true
+exit 0
