@@ -181,7 +181,18 @@ errors = []
 | `simulate-install.sh` | ✅ **63 / 63** |
 | `simulate-upgrade.sh`（0.2.0 → 0.2.1 临时包 + 孤儿进程） | ✅ **46 / 46** |
 
-产物：`fnos/dist/fusionplay-fnos.fpk`，sha256 见发布记录。
+CI 云端构建（GitHub Actions，tag `fnos-v0.2.0` → commit `4904c2b`）：
+[run 40629718303](https://github.com/youyoudezhuzhu/FusionPlay-Android/actions/runs/40629718303)
+全步骤 success（后端/核心/MiPlay 测试 → release 构建 → FPK → check-fpk → simulate-install
+63 断言 → simulate-upgrade 46 断言 → artifact → Release 附件）。
+
+产物：
+- CI artifact（下载后本地复验）：`fusionplay-fnos.fpk`，3,842,355 B，
+  sha256 `bdf093289ba0896cdbac6d2f684d76759c02618f1d72221fc316a20c34f2bf43`，
+  `BUILD-INFO: version=0.2.0 commit=4904c2b built=2026-10-28T04:03:14Z`。
+- GitHub Release：`fnos-v0.2.0`
+  <https://github.com/youyoudezhuzhu/FusionPlay-Android/releases/tag/fnos-v0.2.0>。
+- 本工作区副本：`artifacts/FusionPlay-fnos-0.2.0-x86.fpk`、`fnos/dist/fusionplay-fnos.fpk`。
 
 ### 8.4 未验证边界（v0.2.0 仍为真机项）
 
