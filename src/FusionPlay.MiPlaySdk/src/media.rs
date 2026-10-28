@@ -34,6 +34,15 @@ use symphonia::default::codecs::AacDecoder;
 
 pub type EventEmitter = Arc<dyn Fn(Value) + Send + Sync + 'static>;
 
+static LEGACY_FIXED_MEDIA_COMPATIBILITY: AtomicBool = AtomicBool::new(false);
+
+/// Explicit opt-in compatibility for the legacy fixed-key media family.
+/// Enable before starting the receiver. Session keys still take priority;
+/// this fallback requires a per-PES private IV when no session key is available.
+pub fn enable_legacy_fixed_media_compatibility() {
+    LEGACY_FIXED_MEDIA_COMPATIBILITY.store(true, Ordering::Release);
+}
+
 const POSITION_RESUME_SETTLING_WINDOW: StdDuration = StdDuration::from_millis(1_500);
 
 /**
@@ -1446,6 +1455,7 @@ struct TsDemuxer {
     pes: Vec<u8>,
     pes_rtp_pts_micros: Option<i64>,
     keys: Option<StreamKeys>,
+    legacy_fixed_media: bool,
 }
 
 impl TsDemuxer {
@@ -1454,6 +1464,7 @@ impl TsDemuxer {
             pes: Vec::new(),
             pes_rtp_pts_micros: None,
             keys,
+            legacy_fixed_media: LEGACY_FIXED_MEDIA_COMPATIBILITY.load(Ordering::Acquire),
         }
     }
 
@@ -1530,6 +1541,19 @@ impl TsDemuxer {
                 payload: elementary,
                 pts_micros,
             }));
+        }
+        if self.keys.is_none()
+            && self.legacy_fixed_media
+            && let Some(iv) = pes_private_data_iv(&pes, payload_offset)
+        {
+            self.keys = Some(StreamKeys {
+                auth_key: [0; 16],
+                stream_key: [
+                    0x2b, 0x7e, 0x15, 0x16, 0x28, 0xae, 0xd2, 0xa6, 0xab, 0xf7, 0x15, 0x88, 0x09,
+                    0xcf, 0x4f, 0x3c,
+                ],
+                stream_iv: iv,
+            });
         }
         let Some(keys) = self.keys.as_mut() else {
             return Ok(Some(AudioPes {
@@ -3503,5 +3527,43 @@ mod tests {
         let decoded = demuxer.finish_pes().unwrap().unwrap();
         assert_eq!(decoded.payload, elementary);
         assert_eq!(decoded.pts_micros, None);
+    }
+
+    #[test]
+    fn legacy_fixed_mode_requires_private_iv_and_explicit_opt_in() {
+        // AES-CBC known-answer block; no captured user media or session keys.
+        let cipher = hex::decode("7649abac8119b246cee98e9b12e9197d").unwrap();
+        let plain = hex::decode("6bc1bee22e409f96e93d7e117393172a").unwrap();
+        for (enabled, has_iv) in [(false, true), (true, false), (true, true)] {
+            let header = if has_iv {
+                let mut h = vec![0x80];
+                h.extend(0_u8..16);
+                h
+            } else {
+                vec![]
+            };
+            let declared = 3 + header.len() + cipher.len();
+            let mut pes = vec![
+                0,
+                0,
+                1,
+                0xc0,
+                (declared >> 8) as u8,
+                declared as u8,
+                0x80,
+                if has_iv { 1 } else { 0 },
+                header.len() as u8,
+            ];
+            pes.extend(header);
+            pes.extend(&cipher);
+            let mut demuxer = TsDemuxer::new(None);
+            demuxer.legacy_fixed_media = enabled;
+            demuxer.pes = pes;
+            let decoded = demuxer.finish_pes().unwrap().unwrap();
+            assert_eq!(
+                decoded.payload,
+                if enabled && has_iv { &plain } else { &cipher }.clone()
+            );
+        }
     }
 }
