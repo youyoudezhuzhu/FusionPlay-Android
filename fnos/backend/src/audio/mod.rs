@@ -7,7 +7,11 @@
 //! calibration delay). A `NullBackend` keeps CI and `--no-audio` usable.
 
 pub mod alsa;
+pub mod device;
+pub mod engine;
 pub mod resample;
+
+pub use engine::MultiDeviceBackend;
 
 use anyhow::Result;
 use serde::Serialize;
@@ -47,7 +51,10 @@ pub struct DeviceStatus {
     pub drift_ppm: f32,
     pub underruns: u64,
     pub written_frames: u64,
+    /// `offline|starting|running|idle|error`
     pub state: String,
+    /// Negotiated sample format (`S16_LE`, `S32_LE`, `F32_LE`), empty when offline.
+    pub format: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]

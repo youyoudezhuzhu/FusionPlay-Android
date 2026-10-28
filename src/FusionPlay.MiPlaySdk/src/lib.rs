@@ -16,6 +16,35 @@ use discovery::{MiPlayAdvertisement, idm_short_id};
 use lyra::{LyraControlServer, start_lyra_server};
 pub use media::EventEmitter;
 use protocol::{ControlHub, start_control_server};
+
+/// Host-installed unified PCM destination (fnOS).
+///
+/// The SDK keeps its own cpal/Oboe output by default. A host that owns a
+/// multi-device engine (fnOS) installs this process-wide sink once before
+/// starting the receiver; every media session then forwards its decoded,
+/// volume-scaled stereo PCM here instead of opening a local stream.
+pub trait MiPlayPcmOutput: Send + Sync {
+    fn write(&self, sender_gain: f32, sample_rate: u32, channels: u16, samples: &[f32]);
+    fn flush(&self);
+}
+
+static PROCESS_PCM_OUTPUT: std::sync::OnceLock<
+    std::sync::Mutex<Option<Arc<dyn MiPlayPcmOutput>>>,
+> = std::sync::OnceLock::new();
+
+/// Install (or clear) the process-wide unified PCM output.
+pub fn set_process_pcm_output(output: Option<Arc<dyn MiPlayPcmOutput>>) {
+    let slot = PROCESS_PCM_OUTPUT.get_or_init(|| std::sync::Mutex::new(None));
+    if let Ok(mut guard) = slot.lock() {
+        *guard = output;
+    }
+}
+
+pub(crate) fn process_pcm_output() -> Option<Arc<dyn MiPlayPcmOutput>> {
+    PROCESS_PCM_OUTPUT
+        .get()
+        .and_then(|slot| slot.lock().ok().and_then(|guard| guard.clone()))
+}
 pub use protocol::{DeviceIdentity, InterconnectStage, MediaAction, MediaControlOutcome};
 use serde_json::json;
 use std::net::Ipv4Addr;

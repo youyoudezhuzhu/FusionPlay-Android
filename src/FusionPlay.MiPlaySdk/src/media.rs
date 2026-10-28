@@ -2155,7 +2155,26 @@ struct AacPlayer {
 }
 
 #[cfg(not(target_os = "android"))]
-type NativeAudioStream = cpal::Stream;
+enum NativeAudioStream {
+    Cpal(cpal::Stream),
+    External(ExternalAudioPump),
+}
+
+#[cfg(not(target_os = "android"))]
+struct ExternalAudioPump {
+    stop: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(not(target_os = "android"))]
+impl Drop for ExternalAudioPump {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
 
 #[cfg(target_os = "android")]
 type NativeAudioStream = AndroidMiPlayAudioOutput;
@@ -2406,6 +2425,63 @@ impl AdtsFramer {
 }
 
 #[cfg(not(target_os = "android"))]
+fn spawn_external_audio_output(
+    queue: Arc<Mutex<PcmQueue>>,
+    paused: Arc<AtomicBool>,
+    volume_percent: Arc<AtomicU32>,
+    sink: Arc<dyn crate::MiPlayPcmOutput>,
+    events: EventEmitter,
+) -> NativeAudioStream {
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_for_thread = Arc::clone(&stop);
+    let handle = std::thread::Builder::new()
+        .name("miplay-unified-output".to_owned())
+        .spawn(move || {
+            const CHANNELS: usize = 2;
+            // 10 ms per block; the host engine owns the real device clock and
+            // buffers this feed in per-device rings.
+            let frames_per_tick = (MIPLAY_SOURCE_SAMPLE_RATE / 100).max(CHANNELS);
+            let mut scratch = vec![0.0f32; frames_per_tick * CHANNELS];
+            let mut signal_reported = false;
+            while !stop_for_thread.load(Ordering::Acquire) {
+                std::thread::sleep(StdDuration::from_millis(10));
+                let gain = volume_percent.load(Ordering::Acquire).min(100) as f32 / 100.0;
+                let mut non_silent = false;
+                if paused.load(Ordering::Acquire) {
+                    if let Ok(mut queue) = queue.lock() {
+                        queue.clear();
+                    }
+                    scratch.fill(0.0);
+                } else if let Ok(mut queue) = queue.lock() {
+                    if queue.ready_to_play(frames_per_tick) {
+                        let playback_rate = queue.playback_rate(frames_per_tick, 1.0);
+                        for frame in scratch.chunks_mut(CHANNELS) {
+                            let (left, right) = queue.render_stereo(playback_rate);
+                            frame[0] = left * gain;
+                            frame[1] = right * gain;
+                            non_silent |= left.abs() > 0.000_01 || right.abs() > 0.000_01;
+                        }
+                    } else {
+                        scratch.fill(0.0);
+                    }
+                }
+                if non_silent && !signal_reported {
+                    signal_reported = true;
+                    events(json!({
+                        "event": "audio_output_signal_started",
+                        "protocol": "xiaomi_miplay",
+                        "device_id": "fusionplay-unified",
+                    }));
+                }
+                sink.write(gain, MIPLAY_SAMPLE_RATE_HZ, CHANNELS as u16, &scratch);
+            }
+            sink.flush();
+        })
+        .ok();
+    NativeAudioStream::External(ExternalAudioPump { stop, handle })
+}
+
+#[cfg(not(target_os = "android"))]
 fn open_native_audio_output(
     requested_device: Option<&str>,
     paused: Arc<AtomicBool>,
@@ -2414,6 +2490,30 @@ fn open_native_audio_output(
     latency_telemetry: Arc<MiPlayLatencyTelemetry>,
     events: EventEmitter,
 ) -> Result<(Arc<Mutex<PcmQueue>>, NativeAudioStream)> {
+    // fnOS / unified-engine hosts install a process-wide sink: keep decoding,
+    // clock telemetry and volume semantics, but render into the host engine
+    // instead of opening a single local cpal device.
+    if let Some(sink) = crate::process_pcm_output() {
+        let queue = Arc::new(Mutex::new(PcmQueue::new()));
+        let stream = spawn_external_audio_output(
+            Arc::clone(&queue),
+            paused,
+            volume_percent,
+            sink,
+            Arc::clone(&events),
+        );
+        events(json!({
+            "event": "audio_output_ready",
+            "protocol": "xiaomi_miplay",
+            "requested_device": requested_device,
+            "device_name": "统一音频引擎（fnOS）",
+            "device_id": "fusionplay-unified",
+            "sample_rate": MIPLAY_SAMPLE_RATE_HZ,
+            "channels": 2,
+            "sample_format": "float",
+        }));
+        return Ok((queue, stream));
+    }
     let host = cpal::default_host();
     let requested_match = match requested_device {
         Some(requested) => host
@@ -2534,7 +2634,7 @@ fn open_native_audio_output(
     }
     .context("open native audio output")?;
     stream.play().context("start native audio output")?;
-    Ok((queue, stream))
+    Ok((queue, NativeAudioStream::Cpal(stream)))
 }
 
 #[cfg(target_os = "android")]

@@ -23,6 +23,7 @@ pub struct MediaInfo {
     pub cover_url: Option<String>,
     pub position_ms: Option<u64>,
     pub duration_ms: Option<u64>,
+    pub detail_codec: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]

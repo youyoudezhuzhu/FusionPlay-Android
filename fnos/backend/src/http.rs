@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
 
 use crate::audio::AudioEngine;
@@ -26,6 +26,9 @@ pub struct HttpApp {
     pub www_dir: PathBuf,
     pub gateway_prefix: String,
     pub started: std::time::Instant,
+    /// Protocol hosts; config changes restart them so toggles/name/interface
+    /// take effect without a manual service restart.
+    pub protocols: Mutex<Option<Arc<crate::protocols::ProtocolHosts>>>,
 }
 
 impl HttpApp {
@@ -100,16 +103,16 @@ pub fn start(
 
 fn serve_unix(mut stream: std::os::unix::net::UnixStream, app: Arc<HttpApp>) -> Result<()> {
     let request = read_request(&mut stream)?;
-    handle(request, &mut |status, content_type, body| {
-        write_response(&mut stream, status, content_type, body)
+    handle(request, &mut |status, content_type, body, headers| {
+        write_response(&mut stream, status, content_type, body, headers)
     }, app)
 }
 
 fn serve_tcp(mut stream: TcpStream, app: Arc<HttpApp>) -> Result<()> {
     stream.set_read_timeout(Some(std::time::Duration::from_secs(10))).ok();
     let request = read_request(&mut stream)?;
-    handle(request, &mut |status, content_type, body| {
-        write_response(&mut stream, status, content_type, body)
+    handle(request, &mut |status, content_type, body, headers| {
+        write_response(&mut stream, status, content_type, body, headers)
     }, app)
 }
 
@@ -168,11 +171,18 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|window| window == needle)
 }
 
-fn write_response<S: Write>(stream: &mut S, status: u16, content_type: &str, body: &[u8]) -> Result<()> {
+fn write_response<S: Write>(
+    stream: &mut S,
+    status: u16,
+    content_type: &str,
+    body: &[u8],
+    extra_headers: &[(&str, &str)],
+) -> Result<()> {
     let reason = match status {
         200 => "OK",
         204 => "No Content",
         301 => "Moved Permanently",
+        307 => "Temporary Redirect",
         400 => "Bad Request",
         404 => "Not Found",
         405 => "Method Not Allowed",
@@ -180,10 +190,14 @@ fn write_response<S: Write>(stream: &mut S, status: u16, content_type: &str, bod
         _ => "OK",
     };
     let mut head = format!(
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n",
         body.len()
     )
     .into_bytes();
+    for (name, value) in extra_headers {
+        head.extend_from_slice(format!("{name}: {value}\r\n").as_bytes());
+    }
+    head.extend_from_slice(b"\r\n");
     head.extend_from_slice(body);
     stream.write_all(&head).context("写响应失败")?;
     stream.flush().ok();
@@ -191,20 +205,20 @@ fn write_response<S: Write>(stream: &mut S, status: u16, content_type: &str, bod
 }
 
 fn respond_json(
-    respond: &mut dyn FnMut(u16, &str, &[u8]) -> Result<()>,
+    respond: &mut dyn FnMut(u16, &str, &[u8], &[(&str, &str)]) -> Result<()>,
     value: Value,
 ) -> Result<()> {
     let body = serde_json::to_vec(&value)?;
-    respond(200, "application/json; charset=utf-8", &body)
+    respond(200, "application/json; charset=utf-8", &body, &[])
 }
 
 fn respond_error(
-    respond: &mut dyn FnMut(u16, &str, &[u8]) -> Result<()>,
+    respond: &mut dyn FnMut(u16, &str, &[u8], &[(&str, &str)]) -> Result<()>,
     status: u16,
     message: &str,
 ) -> Result<()> {
     let body = serde_json::to_vec(&json!({"ok": false, "error": message}))?;
-    respond(status, "application/json; charset=utf-8", &body)
+    respond(status, "application/json; charset=utf-8", &body, &[])
 }
 
 fn request_json(request: &Request) -> Result<Value> {
@@ -214,12 +228,19 @@ fn request_json(request: &Request) -> Result<Value> {
     serde_json::from_slice(&request.body).context("请求体不是合法 JSON")
 }
 
-fn handle(request: Request, respond: &mut dyn FnMut(u16, &str, &[u8]) -> Result<()>, app: Arc<HttpApp>) -> Result<()> {
+fn handle(
+    request: Request,
+    respond: &mut dyn FnMut(u16, &str, &[u8], &[(&str, &str)]) -> Result<()>,
+    app: Arc<HttpApp>,
+) -> Result<()> {
     let mut path = request.path.split('?').next().unwrap_or("/").to_string();
     // fnOS unified gateway forwards the full path (`/app/<name>/...`): strip it.
     if !app.gateway_prefix.is_empty() {
         if path == app.gateway_prefix {
-            return respond(301, "text/plain", b"");
+            // fnOS gateway does not strip the prefix; the UI must load with a
+            // trailing slash so its relative asset URLs resolve.
+            let location = format!("{}/", app.gateway_prefix);
+            return respond(307, "text/plain", b"", &[("Location", location.as_str())]);
         }
         if let Some(rest) = path.strip_prefix(&format!("{}/", app.gateway_prefix)) {
             path = format!("/{rest}");
@@ -273,6 +294,9 @@ fn handle(request: Request, respond: &mut dyn FnMut(u16, &str, &[u8]) -> Result<
             incoming.validate()?;
             app.save_config(incoming.clone())?;
             app.engine.configure(incoming.audio.clone())?;
+            if let Some(hosts) = app.protocols.lock().unwrap().clone() {
+                hosts.restart(&incoming)?;
+            }
             Ok(incoming)
         }) {
             Ok(config) => respond_json(&mut *respond, json!({"ok": true, "config": config})),
@@ -381,7 +405,12 @@ fn handle(request: Request, respond: &mut dyn FnMut(u16, &str, &[u8]) -> Result<
                 match incoming.context("配置字段不合法") {
                     Ok(config) => match app.save_config(config.clone()) {
                         Ok(()) => match app.engine.configure(config.audio.clone()) {
-                            Ok(()) => respond_json(&mut *respond, json!({"ok": true, "config": config})),
+                            Ok(()) => {
+                                if let Some(hosts) = app.protocols.lock().unwrap().clone() {
+                                    let _ = hosts.restart(&config);
+                                }
+                                respond_json(&mut *respond, json!({"ok": true, "config": config}))
+                            }
                             Err(error) => respond_error(&mut *respond, 500, &format!("{error:#}")),
                         },
                         Err(error) => respond_error(&mut *respond, 400, &format!("{error:#}")),
@@ -416,11 +445,15 @@ fn handle(request: Request, respond: &mut dyn FnMut(u16, &str, &[u8]) -> Result<
     }
 }
 
-fn serve_static(path: &str, respond: &mut dyn FnMut(u16, &str, &[u8]) -> Result<()>, www_dir: &Path) -> Result<()> {
+fn serve_static(
+    path: &str,
+    respond: &mut dyn FnMut(u16, &str, &[u8], &[(&str, &str)]) -> Result<()>,
+    www_dir: &Path,
+) -> Result<()> {
     let relative = path.trim_start_matches('/');
     let relative = if relative.is_empty() { "index.html" } else { relative };
     if relative.contains("..") {
-        return respond(400, "text/plain", b"bad path");
+        return respond(400, "text/plain", b"bad path", &[]);
     }
     let file = www_dir.join(relative);
     match std::fs::read(&file) {
@@ -435,9 +468,9 @@ fn serve_static(path: &str, respond: &mut dyn FnMut(u16, &str, &[u8]) -> Result<
                 Some("json") => "application/json; charset=utf-8",
                 _ => "application/octet-stream",
             };
-            respond(200, content_type, &body)
+            respond(200, content_type, &body, &[])
         }
-        Err(_) => respond(404, "application/json; charset=utf-8", b"{\"error\":\"not found\"}"),
+        Err(_) => respond(404, "application/json; charset=utf-8", b"{\"error\":\"not found\"}", &[]),
     }
 }
 

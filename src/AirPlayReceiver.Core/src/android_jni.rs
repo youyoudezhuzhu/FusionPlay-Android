@@ -84,6 +84,7 @@ impl AndroidCoreProtocol {
             output_device,
             airplay_enabled: self == Self::AirPlay,
             dlna_enabled: self == Self::Dlna,
+            audio_output: None,
         }
     }
 }

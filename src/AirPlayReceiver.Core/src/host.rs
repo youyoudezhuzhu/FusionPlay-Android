@@ -1,4 +1,6 @@
-use crate::audio::{ReceiverAudioHandler, list_output_devices, start_audio};
+use crate::audio::{PcmOutput, ReceiverAudioHandler, list_output_devices, start_audio};
+#[cfg(not(target_os = "android"))]
+use crate::audio::start_audio_external;
 use crate::dlna::{DmrController, DmrService};
 use crate::events::{CoreEvent, EventSink};
 use crate::pairing::{FilePairingStore, PersistedState};
@@ -13,7 +15,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Settings {
     pub name: String,
     pub pin: Option<String>,
@@ -21,6 +23,23 @@ pub struct Settings {
     pub output_device: Option<String>,
     pub airplay_enabled: bool,
     pub dlna_enabled: bool,
+    /// Host-installed unified output (fnOS). `None` keeps cpal/Oboe output.
+    pub audio_output: Option<std::sync::Arc<dyn PcmOutput>>,
+}
+
+impl std::fmt::Debug for Settings {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Settings")
+            .field("name", &self.name)
+            .field("pin", &self.pin)
+            .field("state_path", &self.state_path)
+            .field("output_device", &self.output_device)
+            .field("airplay_enabled", &self.airplay_enabled)
+            .field("dlna_enabled", &self.dlna_enabled)
+            .field("audio_output", &self.audio_output.as_ref().map(|_| "external"))
+            .finish()
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -129,12 +148,28 @@ pub async fn run_receiver_with_arbiter(
             });
             Vec::new()
         });
-        let runtime = start_audio(
-            Arc::clone(&events),
-            Arc::clone(&arbiter),
-            artwork_dir,
-            settings.output_device.as_deref(),
-        )?;
+        let runtime = match settings.audio_output.as_ref() {
+            #[cfg(not(target_os = "android"))]
+            Some(output) => start_audio_external(
+                Arc::clone(&events),
+                Arc::clone(&arbiter),
+                artwork_dir,
+                Arc::clone(output),
+            )?,
+            #[cfg(target_os = "android")]
+            Some(_) => start_audio(
+                Arc::clone(&events),
+                Arc::clone(&arbiter),
+                artwork_dir,
+                settings.output_device.as_deref(),
+            )?,
+            None => start_audio(
+                Arc::clone(&events),
+                Arc::clone(&arbiter),
+                artwork_dir,
+                settings.output_device.as_deref(),
+            )?,
+        };
         let mut selected_device_reported = false;
         for device in &output_devices {
             let selected = device.id.eq_ignore_ascii_case(&runtime.device_id);
@@ -579,6 +614,7 @@ pub fn parse_settings_from(arguments: impl IntoIterator<Item = String>) -> Resul
         output_device,
         airplay_enabled,
         dlna_enabled,
+        audio_output: None,
     })
 }
 

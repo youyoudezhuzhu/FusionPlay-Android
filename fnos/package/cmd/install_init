@@ -1,3 +1,6 @@
 #!/bin/bash
-# 安装初始化：必须保持空操作（此时 TRIM_PKGVAR 往往还没建好，mkdir 会 permission denied）
+# install_init — 安装文件落盘前调用。
+#
+# 这里必须保持空操作：此时 $TRIM_PKGVAR / $TRIM_PKGHOME 往往还没有建好，
+# mkdir 会 permission denied，反而让安装直接失败。目录创建放到 install_callback。
 exit 0

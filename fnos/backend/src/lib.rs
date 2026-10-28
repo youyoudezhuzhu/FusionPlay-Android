@@ -10,6 +10,7 @@ pub mod config;
 pub mod dlna_player;
 pub mod http;
 pub mod logging;
+pub mod protocols;
 pub mod session;
 pub mod state;
 pub mod volume;

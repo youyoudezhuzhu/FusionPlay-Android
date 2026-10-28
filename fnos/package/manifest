@@ -1,12 +1,20 @@
+# fnOS / FPK manifest（INI，字段名必须使用官方字段）
+# 规范依据：fnOS FPK 开发方法总纲 §2.2
+#   - platform 不是 arch（值：x86 / arm / all；含架构特定二进制时必须写具体架构）
+#   - desc 不是 description；maintainer 不是 developer；service_port 不是 port
+#   - source 第三方固定 thirdparty
+# 本包内含 x86_64 ELF（fnos/backend release 构建），因此 platform = x86；ARM 版需交叉编译后再出包。
 appname               = fusionplay-fnos
 version               = 0.1.0
 display_name          = "FusionPlay"
 desc                  = "把 AirPlay 2 / DLNA / 小米妙播音频接到飞牛 NAS 的音频输出设备（多声卡、发送端主音量、校准）"
 source                = thirdparty
-platform              = all
+platform              = x86
 maintainer            = "youyoudezhuzhu"
 maintainer_url        = https://github.com/youyoudezhuzhu/FusionPlay-Android
 distributor           = "youyoudezhuzhu"
+distributor_url       = https://github.com/youyoudezhuzhu/FusionPlay-Android
+changelog             = "0.1.0：首个 fnOS 版本；AirPlay 2 / DLNA 控制面 / 小米妙播接收，统一多声卡 ALSA 输出，Web 管理面板"
 desktop_uidir         = ui
 desktop_applaunchname = fusionplay-fnos.main
 service_port          = 18080

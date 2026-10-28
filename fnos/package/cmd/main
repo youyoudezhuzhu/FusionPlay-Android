@@ -1,96 +1,188 @@
 #!/bin/bash
-# cmd/main — start / stop / restart / status（status 严格 0=运行中 / 3=未运行）
+# cmd/main — 运行控制：start / stop / restart / status
+#
+# 约定（fnOS 只认这两个值）：status 返回 0 = 运行中，3 = 未运行，其它值会被判为异常。
+#
+# 关键设计（对应总纲 §5.5「升级后功能没变」的隐形故障）：
+#   1. 启动成功判据 = 轮询 /healthz 通过，而不是「进程还活着」（绑不上端口的进程会活一小会儿再死）。
+#   2. 启动前清理陈旧进程：PID 文件丢了但旧进程还占着端口时（升级遗留），按【精确二进制路径】
+#      清掉本应用自己的进程；绝不 pkill 其它应用/系统进程。
+#   3. HOME 无条件覆盖为 $TRIM_PKGHOME（fnOS 注入 HOME=/root，${HOME:-...} 挡不住）。
+#   4. fnOS 不注入 DATA_LIBRARY_PATH，这里补桥接；服务端代码仍做 TRIM_PKGVAR 兜底。
+#   5. 日志按 5 MiB 上限 / 保留尾部 1 MiB 原地轮转（tail-trim，绝不 mv/rename）。
+set -u
+
 APP="${TRIM_APPDEST:-/var/apps/fusionplay-fnos/target}"
 VAR="${TRIM_PKGVAR:-/vol1/@appdata/fusionplay-fnos}"
 PKGHOME="${TRIM_PKGHOME:-/vol1/@apphome/fusionplay-fnos}"
-PORT="${TRIM_SERVICE_PORT:-18080}"
+PORT="${TRIM_SERVICE_PORT:-18080}"          # 默认值必须与 manifest 的 service_port 一致（check-fpk 会校验）
 BIN="$APP/bin/fusionplay-fnos"
 WWW="$APP/www"
 LOG="$VAR/app.log"
 PID_FILE="$VAR/app.pid"
 SOCK="$APP/fusionplay-fnos.sock"
 
-export HOME="$PKGHOME"                                   # 无条件覆盖（fnOS 注入 HOME=/root）
+# HOME 必须无条件覆盖（fnOS 拉起脚本时已注入 HOME=/root；写成 ${HOME:-$PKGHOME} 无效）
+export HOME="$PKGHOME"
 export DATA_LIBRARY_PATH="${DATA_LIBRARY_PATH:-$VAR}"
 export TRIM_SERVICE_PORT="$PORT"
 export GATEWAY_SOCKET="$SOCK"
 export GATEWAY_PREFIX="/app/fusionplay-fnos"
 mkdir -p "$VAR" "$PKGHOME" 2>/dev/null || true
 
+# ★ 上游 shairplay 用环境变量 CI 做测试开关：CI 存在时【跳过 mDNS 注册】，
+#   表现为 AirPlay 在手机上完全搜不到（但 HTTP 管理页正常，极难排查）。fnOS 运行环境
+#   不应有 CI；这里显式清掉，避免宿主机/调试脚本/编排工具把 CI=1 带进服务进程。
+unset CI 2>/dev/null || true
+
+# ---------------- 日志上限（tail-trim，原地重写） ----------------
+# ★ 必须原地重写，不能 mv/rename：子进程的 stdout/stderr、shell 的 >> 都持有同一个 inode，
+#   rename 之后它们继续写进「已改名的旧文件」——表面有轮转，实际在丢日志。
+# ★ 默认值写在函数体内部：测试会从本脚本 sed 提取该函数单独跑，默认值放外面会一起丢。
 trim_log() {
     local file="$1" size tmp max keep
-    max="${LOG_MAX_BYTES:-5242880}"
-    keep="${LOG_KEEP_BYTES:-1048576}"
+    max="${LOG_MAX_BYTES:-5242880}"      # 5 MiB
+    keep="${LOG_KEEP_BYTES:-1048576}"    # 1 MiB
     [ -f "$file" ] || return 0
-    size=$(stat -c%s "$file" 2>/dev/null || echo 0)
-    if [ "$size" -le "$max" ]; then return 0; fi
-    tmp="$file.trim"
-    tail -c "$keep" "$file" > "$tmp" 2>/dev/null || return 0
-    cat "$tmp" > "$file" 2>/dev/null || true   # 原地重写，保持 inode
-    rm -f "$tmp"
+    size="$(stat -c %s "$file" 2>/dev/null || echo 0)"
+    case "$size" in ''|*[!0-9]*) return 0 ;; esac
+    [ "$size" -le "$max" ] && return 0
+    tmp="$file.rotate.tmp"
+    if tail -c "$keep" "$file" > "$tmp.raw" 2>/dev/null; then
+        awk 'NR>1' "$tmp.raw" > "$tmp" 2>/dev/null    # 丢掉被切半的首行
+        if cat "$tmp" > "$file" 2>/dev/null; then      # 原地重写（不是 mv）
+            echo "$(date '+%Y-%m-%d %H:%M:%S') - [logrotate] 日志超过 $((max / 1048576))MiB，已保留尾部 $((keep / 1024))KiB" >> "$file" 2>/dev/null
+        fi
+    fi
+    rm -f "$tmp" "$tmp.raw" 2>/dev/null
+    return 0
 }
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG" 2>/dev/null; trim_log "$LOG"; }
 
-is_running() {
+# ---------------- 进程 / 端口工具 ----------------
+pid_of() {
     local pid=""
-    [ -f "$PID_FILE" ] && pid="$(cat "$PID_FILE" 2>/dev/null)"
-    [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+    [ -f "$PID_FILE" ] && pid="$(tr -dc '0-9' < "$PID_FILE" 2>/dev/null)"
+    [ -n "$pid" ] && printf '%s' "$pid"
+}
+is_running() { local pid; pid="$(pid_of)"; [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; }
+health() { curl -fsS --max-time 2 "http://127.0.0.1:$PORT/healthz" >/dev/null 2>&1; }
+
+have_ss() { command -v ss >/dev/null 2>&1; }
+port_busy() {
+    if have_ss; then
+        ss -H -lnt 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${PORT}\$"
+    else
+        return 1   # 无法检测时交给启动失败 / healthz 兜底
+    fi
 }
 
-health() {
-    curl -fsS --max-time 2 "http://127.0.0.1:$PORT/healthz" >/dev/null 2>&1
+# 只列出「命令行精确包含本应用二进制路径」的进程（排除当前脚本自身），不误伤其它应用。
+our_pids() { pgrep -f -- "$BIN" 2>/dev/null | grep -v "^$$\$" || true; }
+
+kill_stale() {
+    local pids left i
+    pids="$(our_pids)"
+    [ -z "$pids" ] && return 0
+    log "清理本应用陈旧进程: $(echo "$pids" | tr '\n' ' ')"
+    # shellcheck disable=SC2086
+    kill $pids 2>/dev/null || true
+    for i in $(seq 1 25); do
+        left="$(our_pids)"
+        [ -z "$left" ] && return 0
+        sleep 0.2
+    done
+    # shellcheck disable=SC2086
+    kill -9 $pids 2>/dev/null || true
+    sleep 0.3
+    return 0
 }
 
+# ---------------- 启停 ----------------
 start() {
-    if is_running && health; then log "already running pid=$(cat "$PID_FILE")"; return 0; fi
+    if is_running && health; then
+        log "already running pid=$(pid_of)"
+        return 0
+    fi
     if is_running; then
-        log "stale pid $(cat "$PID_FILE"); restarting"
-        kill "$(cat "$PID_FILE")" 2>/dev/null || true
+        log "进程在但不健康（pid=$(pid_of)），重启"
+        kill "$(pid_of)" 2>/dev/null || true
         sleep 1
     fi
-    rm -f "$SOCK" "$PID_FILE"
+    # PID 文件丢失的孤儿进程：/healthz 能应答说明端口被本应用旧进程占着
+    if health; then
+        log "端口 $PORT 有本应用旧进程应答但无 PID 文件，清理陈旧进程"
+        kill_stale
+    fi
+    if port_busy; then
+        if [ -n "$(our_pids)" ]; then kill_stale; fi
+        if port_busy; then
+            log "端口 $PORT 被其它进程占用，拒绝启动（不误杀他人）"
+            return 1
+        fi
+    fi
+    rm -f "$SOCK" "$PID_FILE" 2>/dev/null || true
     chmod +x "$BIN" 2>/dev/null || true
-    [ -x "$BIN" ] || { log "missing binary: $BIN"; return 1; }
-    log "starting $("$BIN" --version 2>/dev/null) port=$PORT home=$HOME var=$VAR"
+    if [ ! -x "$BIN" ]; then
+        log "缺少可执行文件: $BIN"
+        return 1
+    fi
+    log "starting port=$PORT home=$HOME var=$VAR"
     nohup "$BIN" --config "$PKGHOME/config.json" --state-dir "$VAR" --www "$WWW" \
         --listen-tcp "127.0.0.1:$PORT" --listen-unix "$SOCK" >> "$LOG" 2>&1 &
-    local pid=$!
-    echo "$pid" > "$PID_FILE"
-    for _ in $(seq 1 40); do
+    echo "$!" > "$PID_FILE"
+    local i
+    for i in $(seq 1 80); do
         if health; then
-            log "started pid=$pid (health ok)"
+            log "started pid=$(pid_of) (healthz ok)"
             return 0
         fi
-        if ! kill -0 "$pid" 2>/dev/null; then
-            log "start failed: process exited; see $LOG"
-            rm -f "$PID_FILE"
+        if ! is_running; then
+            log "启动失败：进程已退出，见 $LOG"
+            rm -f "$PID_FILE" 2>/dev/null || true
             return 1
         fi
         sleep 0.25
     done
-    log "start pid=$pid but health check timed out"
+    log "启动超时：pid=$(pid_of) 仍在但 /healthz 不通"
     return 1
 }
 
 stop() {
-    local pid=""
-    [ -f "$PID_FILE" ] && pid="$(cat "$PID_FILE" 2>/dev/null)"
+    local pid pids i
+    pid="$(pid_of)"
     if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
         log "stopping pid=$pid"
-        kill "$pid" 2>/dev/null
-        for _ in $(seq 1 30); do kill -0 "$pid" 2>/dev/null || break; sleep 0.2; done
+        kill "$pid" 2>/dev/null || true
+        for i in $(seq 1 40); do
+            kill -0 "$pid" 2>/dev/null || break
+            sleep 0.2
+        done
         kill -9 "$pid" 2>/dev/null || true
     fi
-    pkill -f "$BIN" 2>/dev/null || true
-    rm -f "$PID_FILE" "$SOCK"
+    # 兜底：命令行匹配本应用二进制的残留进程（只清自己的）
+    pids="$(our_pids)"
+    if [ -n "$pids" ]; then
+        # shellcheck disable=SC2086
+        kill $pids 2>/dev/null || true
+        sleep 0.5
+        pids="$(our_pids)"
+        # shellcheck disable=SC2086
+        [ -n "$pids" ] && kill -9 $pids 2>/dev/null || true
+    fi
+    rm -f "$PID_FILE" "$SOCK" 2>/dev/null || true
+    for i in $(seq 1 25); do
+        port_busy || break
+        sleep 0.2
+    done
     log "stopped"
     return 0
 }
 
-case "$1" in
-    start) start ;;
-    stop) stop ;;
+case "${1:-}" in
+    start)   start ;;
+    stop)    stop ;;
     restart) stop; start ;;
-    status) if is_running; then exit 0; else exit 3; fi ;;
-    *) echo "usage: $0 {start|stop|restart|status}" >&2; exit 1 ;;
+    status)  if is_running; then exit 0; else exit 3; fi ;;
+    *)       echo "usage: $0 {start|stop|restart|status}" >&2; exit 1 ;;
 esac

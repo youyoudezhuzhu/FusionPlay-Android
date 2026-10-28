@@ -18,6 +18,7 @@ use fusionplay_fnos::audio::alsa::AlsaBackend;
 use fusionplay_fnos::audio::{AudioEngine, NullBackend, OutputBackend};
 use fusionplay_fnos::config::Config;
 use fusionplay_fnos::http::{self, HttpApp};
+use fusionplay_fnos::protocols::{self, ProtocolHosts};
 use fusionplay_fnos::{logging, state::AppState, VERSION};
 
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
@@ -135,6 +136,18 @@ fn main() -> Result<()> {
     );
     let state = AppState::new();
     let engine = build_engine(&config)?;
+    std::env::set_var("FUSIONPLAY_STATE_DIR", &args.state_dir);
+    let protocol_hosts = match ProtocolHosts::start(&config, Arc::clone(&engine), Arc::clone(&state)) {
+        Ok(hosts) => {
+            tracing::info!("协议宿主已启动");
+            Some(hosts)
+        }
+        Err(error) => {
+            tracing::error!("协议宿主启动失败：{error:#}");
+            state.record_error(format!("协议宿主启动失败：{error:#}"));
+            None
+        }
+    };
     let gateway_prefix = std::env::var("GATEWAY_PREFIX").unwrap_or_else(|_| "/app/fusionplay-fnos".into());
     let app = Arc::new(HttpApp {
         config_path: args.config.clone(),
@@ -144,6 +157,7 @@ fn main() -> Result<()> {
         www_dir: args.www.clone(),
         gateway_prefix,
         started: std::time::Instant::now(),
+        protocols: std::sync::Mutex::new(protocol_hosts.clone()),
     });
     let tcp = match args.listen_tcp {
         Some(address) => Some(address.parse().with_context(|| format!("非法 TCP 地址 {address}"))?),
@@ -159,5 +173,9 @@ fn main() -> Result<()> {
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
     tracing::info!("收到退出信号，正在停止");
+    if let Some(hosts) = &protocol_hosts {
+        hosts.stop();
+    }
+    let _ = &protocols::source_name;
     Ok(())
 }

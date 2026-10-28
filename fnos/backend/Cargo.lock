@@ -734,6 +734,7 @@ dependencies = [
  "alsa 0.9.1",
  "anyhow",
  "fusionplay-miplay-sdk",
+ "if-addrs 0.15.0",
  "libc",
  "rubato",
  "serde",
@@ -2139,6 +2140,8 @@ dependencies = [
  "symphonia-bundle-flac",
  "symphonia-bundle-mp3",
  "symphonia-codec-aac",
+ "symphonia-codec-adpcm",
+ "symphonia-codec-pcm",
  "symphonia-core",
  "symphonia-format-isomp4",
  "symphonia-format-riff",
@@ -2177,6 +2180,26 @@ dependencies = [
  "lazy_static",
  "log",
  "symphonia-common",
+ "symphonia-core",
+]
+
+[[package]]
+name = "symphonia-codec-adpcm"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "445932ecb0c59362fde9c082dd63a75380650c5077fdb8b80b8cac850442a74c"
+dependencies = [
+ "log",
+ "symphonia-core",
+]
+
+[[package]]
+name = "symphonia-codec-pcm"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e04ba75686acbe43542fdd374571195f0530c0b7785ca25cc6840e9c6c4b6eea"
+dependencies = [
+ "log",
  "symphonia-core",
 ]
 

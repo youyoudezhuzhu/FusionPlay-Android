@@ -11,4 +11,7 @@ mod video;
 #[cfg(target_os = "android")]
 mod android_jni;
 
-pub use host::{Settings, desktop_main, parse_settings_from, run_receiver};
+pub use audio::{PcmOutput, PcmSource, start_audio_external};
+pub use events::{CoreEvent, EventSink};
+pub use host::{Settings, desktop_main, parse_settings_from, run_receiver, run_receiver_with_arbiter};
+pub use takeover::{MediaSource, PlaybackArbiter};

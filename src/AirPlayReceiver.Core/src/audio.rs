@@ -27,7 +27,46 @@ use std::sync::{Arc, Mutex};
 #[cfg(target_os = "android")]
 use std::thread;
 #[cfg(target_os = "android")]
+#[cfg(target_os = "android")]
 use std::time::Duration;
+
+/// Which protocol produced a PCM block. Used by host-side unified output
+/// engines (e.g. the fnOS multi-device ALSA engine) for status and arbitration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PcmSource {
+    AirPlay,
+    Dlna,
+    MiPlay,
+}
+
+impl PcmSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::AirPlay => "airplay",
+            Self::Dlna => "dlna",
+            Self::MiPlay => "miplay",
+        }
+    }
+}
+
+/// Optional external PCM destination.
+///
+/// When a host installs one via [`Settings::audio_output`] (fnOS), the core no
+/// longer opens a local cpal stream: it forwards decoded AirPlay PCM to this
+/// sink together with the sender's logical volume (linear 0..=1). Android and
+/// desktop hosts that do not set it keep the existing cpal/Oboe behaviour.
+pub trait PcmOutput: Send + Sync {
+    fn write(
+        &self,
+        source: PcmSource,
+        epoch: u64,
+        sender_gain: f32,
+        sample_rate: u32,
+        channels: u16,
+        samples: &[f32],
+    );
+    fn flush(&self, source: PcmSource);
+}
 
 /// Maximum decoded PCM waiting for the Windows callback.
 ///
@@ -127,7 +166,7 @@ impl AudioBuffer {
 pub struct AudioRuntime {
     pub handler: Arc<ReceiverAudioHandler>,
     #[cfg(not(target_os = "android"))]
-    pub _stream: cpal::Stream,
+    pub _stream: OutputHandle,
     #[cfg(target_os = "android")]
     pub _stream: AndroidAudioOutput,
     pub device_name: String,
@@ -136,6 +175,32 @@ pub struct AudioRuntime {
     pub channels: u16,
     pub sample_format: &'static str,
     pub bits_per_sample: u8,
+}
+
+/// Owns the local output resource for a running receiver.
+///
+/// `Cpal` is the original desktop/Windows path. `External` is a host-installed
+/// [`PcmOutput`] (fnOS): the cpal callback is replaced by a pump thread that
+/// drains the same `AudioBuffer` and calls the sink.
+#[cfg(not(target_os = "android"))]
+pub enum OutputHandle {
+    Cpal(cpal::Stream),
+    External {
+        stop: Arc<AtomicBool>,
+        handle: Option<std::thread::JoinHandle<()>>,
+    },
+}
+
+#[cfg(not(target_os = "android"))]
+impl Drop for OutputHandle {
+    fn drop(&mut self) {
+        if let OutputHandle::External { stop, handle } = self {
+            stop.store(true, Ordering::Release);
+            if let Some(handle) = handle.take() {
+                let _ = handle.join();
+            }
+        }
+    }
 }
 
 #[cfg(target_os = "android")]
@@ -378,13 +443,90 @@ pub fn start_audio(
 
     Ok(AudioRuntime {
         handler,
-        _stream: stream,
+        _stream: OutputHandle::Cpal(stream),
         device_name,
         device_id,
         sample_rate,
         channels,
         sample_format: sample_format_name,
         bits_per_sample,
+    })
+}
+
+/// Start the receiver without a local output device: decoded PCM is forwarded
+/// to a host-installed [`PcmOutput`] (fnOS unified engine). The existing
+/// handler (arbitration, volume, metadata, remote control) is unchanged; only
+/// the cpal callback is replaced by a pump thread.
+#[cfg(not(target_os = "android"))]
+pub fn start_audio_external(
+    events: Arc<EventSink>,
+    arbiter: Arc<PlaybackArbiter>,
+    artwork_dir: PathBuf,
+    output: Arc<dyn PcmOutput>,
+) -> Result<AudioRuntime> {
+    const EXTERNAL_RATE: u32 = 48_000;
+    const EXTERNAL_CHANNELS: u16 = 2;
+    let buffer = Arc::new(Mutex::new(AudioBuffer::new(EXTERNAL_RATE, EXTERNAL_CHANNELS)));
+    let gain_bits = Arc::new(AtomicU32::new(1.0_f32.to_bits()));
+    let stop = Arc::new(AtomicBool::new(false));
+    let pump = {
+        let buffer = Arc::clone(&buffer);
+        let gain_bits = Arc::clone(&gain_bits);
+        let stop = Arc::clone(&stop);
+        let output = Arc::clone(&output);
+        std::thread::Builder::new()
+            .name("fusionplay-external-pump".to_owned())
+            .spawn(move || {
+                let channels = EXTERNAL_CHANNELS as usize;
+                let max_frames = (EXTERNAL_RATE as usize) / 50; // 20 ms per write
+                let mut scratch: Vec<f32> = Vec::with_capacity(max_frames * channels);
+                while !stop.load(Ordering::Acquire) {
+                    scratch.clear();
+                    let sender_gain = f32::from_bits(gain_bits.load(Ordering::Relaxed));
+                    if let Ok(mut queued) = buffer.lock() {
+                        let take = queued.samples.len().min(max_frames * channels);
+                        scratch.extend(queued.samples.drain(..take));
+                    }
+                    if scratch.is_empty() {
+                        std::thread::sleep(std::time::Duration::from_millis(2));
+                        continue;
+                    }
+                    output.write(
+                        PcmSource::AirPlay,
+                        0,
+                        sender_gain,
+                        EXTERNAL_RATE,
+                        EXTERNAL_CHANNELS,
+                        &scratch,
+                    );
+                }
+                output.flush(PcmSource::AirPlay);
+            })
+            .context("无法启动外部音频输出线程")?
+    };
+
+    let handler = Arc::new(ReceiverAudioHandler {
+        buffer,
+        gain_bits,
+        events,
+        arbiter,
+        artwork_dir,
+        output_channels: EXTERNAL_CHANNELS as usize,
+        progress_timebase: AtomicU32::new(0),
+        remote_controls: Mutex::new(RemoteControls::default()),
+        client_connections: Mutex::new(ClientConnections::default()),
+        current_session: Arc::new(Mutex::new(None)),
+    });
+
+    Ok(AudioRuntime {
+        handler,
+        _stream: OutputHandle::External { stop, handle: Some(pump) },
+        device_name: "统一音频引擎（fnOS）".to_owned(),
+        device_id: "fusionplay-unified".to_owned(),
+        sample_rate: EXTERNAL_RATE,
+        channels: EXTERNAL_CHANNELS,
+        sample_format: "float",
+        bits_per_sample: 32,
     })
 }
 

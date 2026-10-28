@@ -1,448 +1,409 @@
-//! ALSA output backend.
+//! Real ALSA device provider + capability probing.
 //!
-//! Real hardware probing (never name-only): `/proc/asound` enumerates cards and
-//! playback PCMs, and each candidate is opened through libasound to read its
-//! actual negotiable format. Each enabled device then gets its own worker
-//! thread with a bounded ring buffer; blocking `writei` is the device clock.
-//! The master `write()` never performs I/O: it only copies into rings.
+//! Probing is deliberately *measured*, never assumed:
+//! - `/proc/asound/{cards,pcm}` provides the stable id (`hw:CARD=<cardid>,DEV=<n>`)
+//!   and human name of every playback PCM;
+//! - each candidate rate is negotiated with `set_rate_near` and then read back
+//!   with `get_rate()` after `hw_params`; it is only reported as supported when
+//!   the actual rate differs from the candidate by at most 1 Hz;
+//! - channels are verified the same way;
+//! - every probe opens and closes its own PCM and returns after closing it.
+//!
+//! `AlsaProvider` caches verified capabilities: while our own worker holds a
+//! device open, a second probe would fail with EBUSY, so the cache keeps
+//! `/api/devices` truthful during playback. A device that disappears is
+//! dropped from the cache and re-probed on hot plug.
+//!
+//! Opening for playback negotiates S16_LE first, then S32_LE, then F32_LE, and
+//! reads the actual rate/channels back. The blocking `writei` in
+//! [`AlsaSink`] is the device clock for that device's worker thread.
 
 use alsa::pcm::{Access, Format, HwParams, PCM};
 use alsa::{Direction, ValueOr};
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use serde::Serialize;
-use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::collections::{HashMap, HashSet};
+use std::sync::Mutex;
+use std::time::Duration;
 
-use super::resample::{DriftEstimator, LinearResampler};
-use super::{
-    AudioSettings, DeviceInfo, DeviceStatus, EngineStatus, OutputBackend,
-};
-use crate::config::DeviceSetting;
-use crate::session::Source;
-use crate::volume::{delay_ms_to_frames, device_db_to_gain, GainChain};
+use super::device::{f32_to_i16, f32_to_i32, DeviceProvider, DeviceSink, OpenedDevice, SampleFormat};
+use super::DeviceInfo;
 
-const DEVICE_RING_MS: usize = 300;
-const MASTER_CHANNELS: usize = 2;
+/// Candidate rates probed against the hardware. Only read-back matches are
+/// advertised.
+const CANDIDATE_RATES: [u32; 4] = [44_100, 48_000, 96_000, 192_000];
+/// Candidate channel counts verified for each playback PCM.
+const CANDIDATE_CHANNELS: [u32; 2] = [2, 1];
 
-/// Parse `/proc/asound/cards` + `/proc/asound/pcm` into stable candidates.
-pub fn probe_devices() -> Vec<DeviceInfo> {
-    let mut cards = std::collections::HashMap::<String, (String, String)>::new();
-    if let Ok(text) = std::fs::read_to_string("/proc/asound/cards") {
-        for line in text.lines() {
-            // " 0 [PCH   ]: HDA-Intel - HDA Intel PCH"
-            let Some((idx, rest)) = line.trim().split_once('[') else { continue };
-            let card_num = idx.trim();
-            let Ok(card_index) = card_num.parse::<u32>() else { continue };
-            let Some((card_id, name)) = rest.split_once(']') else { continue };
-            let name = name.trim_start_matches(':').trim();
-            // /proc/asound/cards uses "0", /proc/asound/pcm uses "00": normalise.
-            cards.insert(card_index.to_string(), (card_id.trim().to_string(), name.to_string()));
-        }
+/// Parse `/proc/asound/cards` into `card index -> (card id, card name)`.
+fn scan_cards() -> HashMap<u32, (String, String)> {
+    let mut cards = HashMap::new();
+    let Ok(text) = std::fs::read_to_string("/proc/asound/cards") else {
+        return cards;
+    };
+    for line in text.lines() {
+        // " 0 [PCH   ]: HDA-Intel - HDA Intel PCH"
+        let Some((index, rest)) = line.trim().split_once('[') else { continue };
+        let Ok(card_index) = index.trim().parse::<u32>() else { continue };
+        let Some((card_id, tail)) = rest.split_once(']') else { continue };
+        let name = tail.trim_start_matches(':').trim();
+        cards.insert(card_index, (card_id.trim().to_string(), name.to_string()));
     }
+    cards
+}
+
+/// Parse `/proc/asound/pcm` into playback device descriptors.
+fn scan_playback_devices() -> Vec<(String, String, String, u32)> {
+    let cards = scan_cards();
     let mut devices = Vec::new();
-    if let Ok(text) = std::fs::read_to_string("/proc/asound/pcm") {
-        for line in text.lines() {
-            // "00-00: ALC269VC Analog : playback 1 : capture 1"
-            if !line.contains("playback") {
-                continue;
-            }
-            let Some((pcm_id, rest)) = line.split_once(':') else { continue };
-            let pcm_id = pcm_id.trim();
-            let Some((card_num, dev_num)) = pcm_id.split_once('-') else { continue };
-            let Ok(card_index) = card_num.trim().parse::<u32>() else { continue };
-            let card_num = card_index.to_string();
-            let label = rest
-                .split(" : playback")
-                .next()
-                .unwrap_or(rest)
-                .trim()
-                .trim_end_matches(':')
-                .trim()
-                .to_string();
-            let Some((card_id, card_name)) = cards.get(&card_num) else { continue };
-            let device: u32 = match dev_num.trim().parse() {
-                Ok(value) => value,
-                Err(_) => continue,
-            };
-            let id = format!("hw:CARD={card_id},DEV={device}");
-            let (sample_rates, channels, online) = probe_capabilities(&id);
-            devices.push(DeviceInfo {
-                id,
-                name: format!("{} ({})", label, card_name),
-                card: card_id.clone(),
-                device,
-                sample_rates,
-                channels,
-                is_default: false,
-                online,
-            });
+    let Ok(text) = std::fs::read_to_string("/proc/asound/pcm") else {
+        return devices;
+    };
+    for line in text.lines() {
+        // "00-00: ALC269VC Analog : playback 1 : capture 1"
+        if !line.contains("playback") {
+            continue;
         }
+        let Some((pcm_id, rest)) = line.split_once(':') else { continue };
+        let Some((card_num, dev_num)) = pcm_id.trim().split_once('-') else { continue };
+        let Ok(card_index) = card_num.trim().parse::<u32>() else { continue };
+        let Ok(device) = dev_num.trim().parse::<u32>() else { continue };
+        let Some((card_id, card_name)) = cards.get(&card_index) else { continue };
+        let label = rest
+            .split(" : playback")
+            .next()
+            .unwrap_or(rest)
+            .trim()
+            .trim_end_matches(':')
+            .trim()
+            .to_string();
+        let id = format!("hw:CARD={card_id},DEV={device}");
+        let name = format!("{label} ({card_name})");
+        devices.push((id, name, card_id.clone(), device));
     }
     devices
 }
 
-/// Open the PCM and read back the actual negotiated format. Returns
-/// `(rates, channels, online)`; offline is not hidden from the UI.
-fn probe_capabilities(id: &str) -> (Vec<u32>, u16, bool) {
-    let Ok(pcm) = PCM::new(id, Direction::Playback, false) else {
-        return (vec![], 0, false);
-    };
+/// Measured capabilities of one PCM.
+#[derive(Debug, Clone)]
+struct Capabilities {
+    rates: Vec<u32>,
+    channels: u16,
+    online: bool,
+}
+
+impl Capabilities {
+    fn offline() -> Self {
+        Self { rates: Vec::new(), channels: 0, online: false }
+    }
+}
+
+fn to_alsa(format: SampleFormat) -> Format {
+    match format {
+        SampleFormat::S16Le => Format::s16(),
+        SampleFormat::S32Le => Format::s32(),
+        SampleFormat::F32Le => Format::float(),
+    }
+}
+
+/// Try to negotiate `channels` / `rate` / `format` on a *fresh* PCM and read
+/// the actual values back. The PCM is closed before this function returns.
+fn probe_one(id: &str, channels: u32, rate: u32, format: SampleFormat) -> Option<(u32, u32)> {
+    let pcm = PCM::new(id, Direction::Playback, false).ok()?;
+    let hwp = HwParams::any(&pcm).ok()?;
+    hwp.set_channels(channels).ok()?;
+    hwp.set_access(Access::RWInterleaved).ok()?;
+    hwp.set_format(to_alsa(format)).ok()?;
+    hwp.set_rate_near(rate, ValueOr::Nearest).ok()?;
+    if pcm.hw_params(&hwp).is_err() {
+        return None;
+    }
+    let actual_rate = hwp.get_rate().ok()?;
+    let actual_channels = hwp.get_channels().ok()?;
+    // `pcm` is dropped here (closed) before returning.
+    Some((actual_rate, actual_channels))
+}
+
+/// Measure a device's real capabilities. Each candidate is negotiated and then
+/// read back; a candidate counts as supported only when the read-back value is
+/// within ±1 Hz of the candidate (and, for channels, exactly the candidate).
+fn probe_capabilities(id: &str) -> Capabilities {
+    // First make sure the PCM can be opened at all; this is also the "online"
+    // signal. The handle is closed immediately.
+    if PCM::new(id, Direction::Playback, false).is_err() {
+        return Capabilities::offline();
+    }
+
     let mut rates = Vec::new();
-    let mut channels = 0;
-    for rate in [44_100u32, 48_000, 96_000, 192_000] {
-        let Ok(hwp) = HwParams::any(&pcm) else { continue };
-        if hwp.set_channels(2).is_err()
-            || hwp.set_access(Access::RWInterleaved).is_err()
-            || hwp.set_format(Format::s16()).is_err()
-            || hwp.set_rate_near(rate, ValueOr::Nearest).is_err()
+    for candidate in CANDIDATE_RATES {
+        if let Some((actual_rate, actual_channels)) =
+            probe_one(id, 2, candidate, SampleFormat::S16Le)
         {
-            continue;
+            if (actual_rate as i64 - candidate as i64).abs() <= 1
+                && actual_channels == 2
+                && !rates.contains(&actual_rate)
+            {
+                rates.push(actual_rate);
+            }
         }
-        if pcm.hw_params(&hwp).is_err() {
-            continue;
-        }
-        rates.push(hwp.get_rate().unwrap_or(rate));
-        channels = channels.max(hwp.get_channels().unwrap_or(2));
     }
     rates.sort_unstable();
-    rates.dedup();
-    (rates, channels.max(2) as u16, true)
-}
 
-/// One enabled device: bounded ring + worker thread.
-struct DeviceWorker {
-    setting: DeviceSetting,
-    info: DeviceInfo,
-    ring: Arc<Mutex<VecDeque<f32>>>,
-    control: Arc<DeviceControl>,
-    stop: Arc<std::sync::atomic::AtomicBool>,
-    handle: Option<thread::JoinHandle<()>>,
-    written: Arc<AtomicU64>,
-    underruns: Arc<AtomicU64>,
-    drift_ppm: Arc<Mutex<f32>>,
-}
-
-struct DeviceControl {
-    gain: Mutex<f32>,
-    target_rate: Mutex<u32>,
-}
-
-impl DeviceWorker {
-    fn ring_capacity_frames(rate: u32) -> usize {
-        (rate as usize * DEVICE_RING_MS / 1000).max(256)
-    }
-}
-
-pub struct AlsaBackend {
-    settings: RwLock<AudioSettings>,
-    workers: Mutex<Vec<DeviceWorker>>,
-    master_frames: AtomicU64,
-    dropped_frames: AtomicU64,
-    source: RwLock<Option<Source>>,
-    /// Last accepted lease; set by the host through `set_lease`.
-    lease_ok: Mutex<Option<(Source, u64)>>,
-}
-
-impl AlsaBackend {
-    pub fn new(settings: &AudioSettings) -> Result<Arc<Self>> {
-        let backend = Arc::new(Self {
-            settings: RwLock::new(settings.clone()),
-            workers: Mutex::new(Vec::new()),
-            master_frames: AtomicU64::new(0),
-            dropped_frames: AtomicU64::new(0),
-            source: RwLock::new(None),
-            lease_ok: Mutex::new(None),
-        });
-        backend.rebuild_workers()?;
-        Ok(backend)
-    }
-
-    /// Recreate device workers from the current settings (hotplug / config).
-    fn rebuild_workers(&self) -> Result<()> {
-        let settings = self.settings.read().unwrap().clone();
-        let available = probe_devices();
-        let mut workers = self.workers.lock().unwrap();
-        for worker in workers.iter_mut() {
-            worker.stop.store(true, Ordering::Release);
-            if let Some(handle) = worker.handle.take() {
-                let _ = handle.join();
+    let mut channels = 0u16;
+    for candidate in CANDIDATE_CHANNELS {
+        if let Some((_, actual_channels)) = probe_one(id, candidate, 48_000, SampleFormat::S16Le) {
+            if actual_channels == candidate {
+                channels = channels.max(candidate as u16);
             }
         }
-        workers.clear();
-        for setting in settings.devices.iter().filter(|device| device.enabled) {
-            let Some(info) = available.iter().find(|info| info.id == setting.id).cloned() else {
-                // Keep an explicit offline worker so the UI shows the truth.
-                let stop = Arc::new(std::sync::atomic::AtomicBool::new(true));
-                workers.push(DeviceWorker {
-                    setting: setting.clone(),
-                    info: DeviceInfo {
-                        id: setting.id.clone(),
-                        name: setting.name.clone(),
-                        card: String::new(),
-                        device: 0,
-                        sample_rates: vec![],
-                        channels: 0,
-                        is_default: false,
-                        online: false,
-                    },
-                    ring: Arc::new(Mutex::new(VecDeque::new())),
-                    control: Arc::new(DeviceControl {
-                        gain: Mutex::new(1.0),
-                        target_rate: Mutex::new(0),
-                    }),
-                    stop,
-                    handle: None,
-                    written: Arc::new(AtomicU64::new(0)),
-                    underruns: Arc::new(AtomicU64::new(0)),
-                    drift_ppm: Arc::new(Mutex::new(0.0)),
-                });
-                continue;
-            };
-            let rate = if setting.sample_rate != 0 {
-                setting.sample_rate
-            } else {
-                info.sample_rates.iter().copied().find(|rate| *rate == 48_000).unwrap_or(48_000)
-            };
-            let gain = device_db_to_gain(setting.gain_db);
-            let control = Arc::new(DeviceControl {
-                gain: Mutex::new(gain),
-                target_rate: Mutex::new(rate),
-            });
-            let ring = Arc::new(Mutex::new(VecDeque::<f32>::with_capacity(
-                DeviceWorker::ring_capacity_frames(rate) * MASTER_CHANNELS,
-            )));
-            // Calibration delay: pre-fill the ring with silence.
-            let delay_frames = delay_ms_to_frames(setting.delay_ms, rate);
-            if delay_frames > 0 {
-                let mut guard = ring.lock().unwrap();
-                for _ in 0..delay_frames * MASTER_CHANNELS {
-                    guard.push_back(0.0);
-                }
+    }
+
+    Capabilities { rates, channels, online: true }
+}
+
+/// Enumerate playback PCMs and probe each one's real capabilities.
+///
+/// This is the function behind `fusionplay-fnos --probe`; it measures the
+/// hardware instead of advertising a fixed list.
+pub fn probe_devices() -> Vec<DeviceInfo> {
+    scan_playback_devices()
+        .into_iter()
+        .map(|(id, name, card, device)| {
+            let capabilities = probe_capabilities(&id);
+            let online = capabilities.online && capabilities.channels >= 2;
+            DeviceInfo {
+                id,
+                name,
+                card,
+                device,
+                sample_rates: capabilities.rates,
+                channels: capabilities.channels,
+                is_default: false,
+                online,
             }
-            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let written = Arc::new(AtomicU64::new(0));
-            let underruns = Arc::new(AtomicU64::new(0));
-            let drift_ppm = Arc::new(Mutex::new(0.0));
-            let handle = {
-                let id = setting.id.clone();
-                let ring = Arc::clone(&ring);
-                let stop = Arc::clone(&stop);
-                let written = Arc::clone(&written);
-                let underruns = Arc::clone(&underruns);
-                let drift_ppm = Arc::clone(&drift_ppm);
-                let control = Arc::clone(&control);
-                thread::Builder::new()
-                    .name(format!("alsa-{}", setting.id))
-                    .spawn(move || {
-                        if let Err(error) = device_thread(
-                            &id, &ring, &stop, &written, &underruns, &drift_ppm, &control, rate,
-                        ) {
-                            eprintln!("[audio] 设备 {id} 输出线程退出：{error:#}");
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone)]
+struct CachedCapabilities {
+    rates: Vec<u32>,
+    channels: u16,
+    online: bool,
+}
+
+/// ALSA implementation of [`DeviceProvider`].
+pub struct AlsaProvider {
+    cache: Mutex<HashMap<String, CachedCapabilities>>,
+}
+
+impl AlsaProvider {
+    pub fn new() -> Self {
+        Self { cache: Mutex::new(HashMap::new()) }
+    }
+}
+
+impl Default for AlsaProvider {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DeviceProvider for AlsaProvider {
+    fn enumerate(&self) -> Vec<DeviceInfo> {
+        let present = scan_playback_devices();
+        let mut cache = match self.cache.lock() {
+            Ok(guard) => guard,
+            Err(_) => return Vec::new(),
+        };
+        let present_ids: HashSet<&str> = present.iter().map(|(id, _, _, _)| id.as_str()).collect();
+        // Forget capabilities of unplugged devices so a re-plug is re-probed.
+        cache.retain(|id, _| present_ids.contains(id.as_str()));
+        present
+            .into_iter()
+            .map(|(id, name, card, device)| {
+                let cached = cache.get(&id).cloned();
+                let cached = match cached {
+                    Some(cached) if cached.online => cached,
+                    _ => {
+                        let capabilities = probe_capabilities(&id);
+                        let entry = CachedCapabilities {
+                            rates: capabilities.rates.clone(),
+                            channels: capabilities.channels,
+                            online: capabilities.online,
+                        };
+                        if capabilities.online {
+                            cache.insert(id.clone(), entry.clone());
                         }
-                    })
-                    .context("无法创建设备输出线程")?
-            };
-            workers.push(DeviceWorker {
-                setting: setting.clone(),
-                info,
-                ring,
-                control,
-                stop,
-                handle: Some(handle),
-                written,
-                underruns,
-                drift_ppm,
-            });
-        }
-        Ok(())
+                        entry
+                    }
+                };
+                DeviceInfo {
+                    id,
+                    name,
+                    card,
+                    device,
+                    sample_rates: cached.rates,
+                    channels: cached.channels,
+                    is_default: false,
+                    online: cached.online && cached.channels >= 2,
+                }
+            })
+            .collect()
+    }
+
+    fn open(&self, id: &str, wanted_rate: u32, wanted_channels: u16) -> Result<OpenedDevice> {
+        open_alsa(id, wanted_rate, wanted_channels)
     }
 }
 
-fn device_thread(
-    id: &str,
-    ring: &Arc<Mutex<VecDeque<f32>>>,
-    stop: &Arc<std::sync::atomic::AtomicBool>,
-    written: &Arc<AtomicU64>,
-    underruns: &Arc<AtomicU64>,
-    drift_ppm: &Arc<Mutex<f32>>,
-    control: &Arc<DeviceControl>,
-    initial_rate: u32,
+/// Blocking `writei` sink. Format conversion happens here, once per batch.
+struct AlsaSink {
+    pcm: PCM,
+    format: SampleFormat,
+    channels: usize,
+    i16_buffer: Vec<i16>,
+    i32_buffer: Vec<i32>,
+}
+
+impl AlsaSink {
+    fn write_i16(&mut self, samples: &[f32]) -> Result<()> {
+        f32_to_i16(samples, &mut self.i16_buffer);
+        let io = self.pcm.io_i16().context("无法获取 S16 输出通道")?;
+        write_all(&self.pcm, &io, &self.i16_buffer, self.channels)
+    }
+
+    fn write_i32(&mut self, samples: &[f32]) -> Result<()> {
+        f32_to_i32(samples, &mut self.i32_buffer);
+        let io = self.pcm.io_i32().context("无法获取 S32 输出通道")?;
+        write_all(&self.pcm, &io, &self.i32_buffer, self.channels)
+    }
+}
+
+fn write_all<S: Copy>(
+    pcm: &PCM,
+    io: &alsa::pcm::IO<S>,
+    buffer: &[S],
+    channels: usize,
 ) -> Result<()> {
-    let pcm = PCM::new(id, Direction::Playback, false).with_context(|| format!("打开 {id} 失败"))?;
-    let rate = {
-        let mut hwp = HwParams::any(&pcm)?;
-        hwp.set_channels(MASTER_CHANNELS as u32)?;
-        hwp.set_access(Access::RWInterleaved)?;
-        hwp.set_format(Format::s16())?;
-        hwp.set_rate_near(initial_rate, ValueOr::Nearest)?;
-        pcm.hw_params(&hwp)?;
-        hwp.get_rate().unwrap_or(initial_rate)
-    };
-    let mut io = pcm.io_i16()?;
-    let mut resampler = LinearResampler::new(MASTER_CHANNELS);
-    let target_fill = (rate as usize * 120 / 1000).max(256) as f32;
-    let mut drift = DriftEstimator::new(target_fill as usize, 0.02, 500.0);
-    let mut scratch: Vec<f32> = Vec::with_capacity(4096);
-    let mut scratch_i16: Vec<i16> = Vec::with_capacity(4096);
-    let mut last = Instant::now();
-    while !stop.load(Ordering::Acquire) {
-        let gain = *control.gain.lock().unwrap();
-        let mut guard = ring.lock().unwrap();
-        let available = guard.len();
-        let take = available.min(2048 * MASTER_CHANNELS);
-        scratch.clear();
-        scratch.extend(guard.drain(..take));
-        drop(guard);
-        if scratch.is_empty() {
-            // Track underruns: a device that has been starving for a while is
-            // reported instead of silently glitching.
-            if last.elapsed() > Duration::from_millis(200) {
-                underruns.fetch_add(1, Ordering::Relaxed);
-                last = Instant::now();
+    let mut offset = 0usize;
+    while offset < buffer.len() {
+        match io.writei(&buffer[offset..]) {
+            Ok(0) => break,
+            Ok(frames) => offset += frames * channels,
+            Err(error) => {
+                // Underrun / suspend recovery: retry once the PCM is in a
+                // workable state, otherwise report the device as failed.
+                if pcm.try_recover(error, true).is_ok() {
+                    continue;
+                }
+                return Err(error).context("ALSA writei 失败");
             }
-            thread::sleep(Duration::from_millis(3));
-            continue;
-        }
-        last = Instant::now();
-        let fill = ring.lock().unwrap().len() as f32 / MASTER_CHANNELS as f32;
-        let ppm = drift.update(fill);
-        *drift_ppm.lock().unwrap() = ppm;
-        let ratio = if (rate as f64 - 0.0).abs() > 0.0 { drift.ratio() } else { 1.0 };
-        let resampled = resampler.process(&scratch, ratio);
-        scratch_i16.clear();
-        scratch_i16.extend(resampled.iter().map(|sample| {
-            let value = (sample * gain * 32767.0).clamp(-32768.0, 32767.0);
-            value as i16
-        }));
-        if !scratch_i16.is_empty() {
-            let frames = scratch_i16.len() / MASTER_CHANNELS;
-            let _ = io.writei(&scratch_i16[..frames * MASTER_CHANNELS]);
-            written.fetch_add(frames as u64, Ordering::Relaxed);
         }
     }
-    let _ = pcm.drain();
     Ok(())
 }
 
-impl OutputBackend for AlsaBackend {
-    fn configure(&self, settings: &AudioSettings) -> Result<()> {
-        *self.settings.write().unwrap() = settings.clone();
-        self.rebuild_workers()
+impl DeviceSink for AlsaSink {
+    fn format(&self) -> SampleFormat {
+        self.format
     }
 
-    fn devices(&self) -> Vec<DeviceInfo> {
-        probe_devices()
-    }
-
-    fn status(&self) -> EngineStatus {
-        let workers = self.workers.lock().unwrap();
-        let devices = workers
-            .iter()
-            .map(|worker| {
-                let setting = &worker.setting;
-                let rate = *worker.control.target_rate.lock().unwrap();
-                let fill = worker.ring.lock().unwrap().len() / MASTER_CHANNELS;
-                DeviceStatus {
-                    id: setting.id.clone(),
-                    name: worker.info.name.clone(),
-                    online: worker.info.online,
-                    enabled: setting.enabled,
-                    gain_db: setting.gain_db,
-                    delay_ms: setting.delay_ms,
-                    sample_rate: rate,
-                    channels: MASTER_CHANNELS as u16,
-                    buffer_ms: (fill as f32) * 1000.0 / rate.max(1) as f32,
-                    drift_ppm: *worker.drift_ppm.lock().unwrap(),
-                    underruns: worker.underruns.load(Ordering::Relaxed),
-                    written_frames: worker.written.load(Ordering::Relaxed),
-                    state: if worker.info.online { "running".into() } else { "offline".into() },
-                }
-            })
-            .collect();
-        EngineStatus {
-            mode: "alsa".to_string(),
-            source: self.source.read().unwrap().map(|s| s.as_str().to_string()),
-            master_frames: self.master_frames.load(Ordering::Relaxed),
-            dropped_frames: self.dropped_frames.load(Ordering::Relaxed),
-            devices,
-        }
-    }
-
-    fn write(
-        &self,
-        source: Source,
-        epoch: u64,
-        sender_gain: f32,
-        _sample_rate: u32,
-        channels: u16,
-        samples: &[f32],
-    ) {
-        if channels as usize != MASTER_CHANNELS || samples.is_empty() {
-            self.dropped_frames.fetch_add(1, Ordering::Relaxed);
-            return;
-        }
-        if let Ok(guard) = self.lease_ok.lock() {
-            if let Some((lease_source, lease_epoch)) = *guard {
-                if lease_source != source || lease_epoch != epoch {
-                    self.dropped_frames.fetch_add(1, Ordering::Relaxed);
-                    return;
-                }
-            }
-        }
-        *self.source.write().unwrap() = Some(source);
-        let settings = self.settings.read().unwrap().clone();
-        let chain = GainChain {
-            global_attenuation_percent: settings.global_attenuation_percent,
-            curve: settings.curve.clone(),
-            muted: settings.muted,
-        };
-        let master_gain = chain.apply(sender_gain);
-        self.master_frames.fetch_add((samples.len() / MASTER_CHANNELS) as u64, Ordering::Relaxed);
-        let workers = self.workers.lock().unwrap();
-        for worker in workers.iter() {
-            if !worker.info.online || !worker.setting.enabled {
-                continue;
-            }
-            let capacity = DeviceWorker::ring_capacity_frames(*worker.control.target_rate.lock().unwrap()) * MASTER_CHANNELS;
-            let mut ring = worker.ring.lock().unwrap();
-            for sample in samples {
-                ring.push_back(sample * master_gain);
-            }
-            while ring.len() > capacity {
-                ring.pop_front();
-                self.dropped_frames.fetch_add(1, Ordering::Relaxed);
+    fn write(&mut self, samples: &[f32]) -> Result<()> {
+        match self.format {
+            SampleFormat::S16Le => self.write_i16(samples),
+            SampleFormat::S32Le => self.write_i32(samples),
+            SampleFormat::F32Le => {
+                let io = self.pcm.io_f32().context("无法获取 F32 输出通道")?;
+                write_all(&self.pcm, &io, samples, self.channels)
             }
         }
     }
 
-    fn flush(&self, _source: Source) {
-        let workers = self.workers.lock().unwrap();
-        for worker in workers.iter() {
-            worker.ring.lock().unwrap().clear();
-        }
-    }
-
-    fn test_tone(&self, device_id: &str) -> Result<()> {
-        let workers = self.workers.lock().unwrap();
-        let worker = workers
-            .iter()
-            .find(|worker| worker.setting.id == device_id)
-            .with_context(|| format!("设备未启用或不存在：{device_id}"))?;
-        let rate = *worker.control.target_rate.lock().unwrap();
-        let frames = rate as usize; // 1 s
-        let mut ring = worker.ring.lock().unwrap();
-        for i in 0..frames {
-            let t = i as f32 / rate as f32;
-            let sample = (t * 1000.0 * std::f32::consts::TAU).sin() * 0.2;
-            ring.push_back(sample);
-            ring.push_back(sample);
-        }
-        Ok(())
+    fn drain(&mut self) {
+        let _ = self.pcm.drain();
     }
 }
+
+/// Open a playback device, negotiating S16_LE first, then S32_LE, then F32_LE.
+/// The actual rate and channel count are read back from the hardware.
+fn open_alsa(id: &str, wanted_rate: u32, wanted_channels: u16) -> Result<OpenedDevice> {
+    let wanted_rate = wanted_rate.max(1);
+    let wanted_channels = wanted_channels.max(1);
+    let mut last_error: Option<anyhow::Error> = None;
+    for format in [SampleFormat::S16Le, SampleFormat::S32Le, SampleFormat::F32Le] {
+        let pcm = match PCM::new(id, Direction::Playback, false) {
+            Ok(pcm) => pcm,
+            Err(error) => {
+                return Err(error).with_context(|| format!("打开 ALSA 设备 {id} 失败"));
+            }
+        };
+        let hwp = match HwParams::any(&pcm) {
+            Ok(hwp) => hwp,
+            Err(error) => {
+                last_error = Some(error.into());
+                continue;
+            }
+        };
+        if let Err(error) = hwp.set_channels(wanted_channels as u32) {
+            last_error = Some(error.into());
+            continue;
+        }
+        if let Err(error) = hwp.set_access(Access::RWInterleaved) {
+            last_error = Some(error.into());
+            continue;
+        }
+        if let Err(error) = hwp.set_format(to_alsa(format)) {
+            last_error = Some(error.into());
+            continue;
+        }
+        if let Err(error) = hwp.set_rate_near(wanted_rate, ValueOr::Nearest) {
+            last_error = Some(error.into());
+            continue;
+        }
+        // Best effort buffering: ~200 ms, 4 periods. Some devices reject these
+        // hints; the defaults then still work, so failures are ignored.
+        let _ = hwp.set_periods(4, ValueOr::Nearest);
+        let _ = hwp.set_buffer_size_near((wanted_rate as i64 * 200 / 1000).max(512));
+        if let Err(error) = pcm.hw_params(&hwp) {
+            last_error = Some(error.into());
+            continue;
+        }
+        let actual_rate = hwp.get_rate().unwrap_or(wanted_rate);
+        let actual_channels = hwp.get_channels().unwrap_or(wanted_channels as u32) as u16;
+        if actual_channels != wanted_channels {
+            last_error = Some(anyhow!(
+                "设备 {id} 协商到 {actual_channels} 声道（期望 {wanted_channels}），跳过 {format:?}"
+            ));
+            continue;
+        }
+        let _ = pcm.prepare();
+        drop(hwp);
+        eprintln!(
+            "[audio] 设备 {id} 已打开：{actual_rate} Hz / {actual_channels} ch / {}",
+            format.name()
+        );
+        return Ok(OpenedDevice {
+            sink: Box::new(AlsaSink {
+                pcm,
+                format,
+                channels: actual_channels as usize,
+                i16_buffer: Vec::new(),
+                i32_buffer: Vec::new(),
+            }),
+            rate: actual_rate,
+            channels: actual_channels,
+            format,
+        });
+    }
+    Err(last_error.unwrap_or_else(|| anyhow!("设备 {id} 无法协商任何输出格式")))
+}
+
+/// Backwards-compatible name for the ALSA-backed multi-device engine.
+///
+/// `main.rs` and the HTTP API construct it through `AlsaBackend::new(...)`;
+/// everything else lives in [`super::engine::MultiDeviceBackend`].
+pub type AlsaBackend = super::engine::MultiDeviceBackend;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct AlsaDiagnostic {
@@ -458,16 +419,23 @@ pub fn diagnostics() -> AlsaDiagnostic {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn probe_never_panics_and_returns_stable_ids() {
-        let devices = probe_devices();
-        for device in &devices {
-            assert!(device.id.starts_with("hw:CARD="), "unexpected id {}", device.id);
-            assert!(device.id.contains(",DEV="));
-        }
-    }
+/// Human readable summary for `--probe`.
+pub fn probe_summary() -> Vec<String> {
+    probe_devices()
+        .into_iter()
+        .map(|device| {
+            format!(
+                "{} | {} | rates={:?} ch={} online={}",
+                device.id, device.name, device.sample_rates, device.channels, device.online
+            )
+        })
+        .collect()
 }
+
+/// Wait helper used by diagnostics/tests: is any playback PCM visible?
+pub fn has_playback_devices() -> bool {
+    !scan_playback_devices().is_empty()
+}
+
+/// Optional settle time used by tests that simulate hot plug timing.
+pub const DEFAULT_SETTLE: Duration = Duration::from_millis(50);

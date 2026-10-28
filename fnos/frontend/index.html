@@ -2,90 +2,360 @@
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>FusionPlay · 飞牛</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<title>FusionPlay · fnOS 管理界面</title>
+<link rel="icon" href="data:,">
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
-<header>
-  <div class="brand"><span class="logo">▶</span><h1>FusionPlay</h1><span class="sub">AirPlay 2 · DLNA · 小米妙播</span></div>
-  <div class="head-right"><span id="health" class="dot"></span><span id="health-text">连接中…</span><span id="version" class="pill">v?</span></div>
-</header>
+<a class="skip-link" href="#main">跳到主要内容</a>
 
-<main>
-  <section class="grid">
-    <article class="card">
-      <div class="card-head"><h2>概览</h2><span id="source-badge" class="badge">空闲</span></div>
-      <div class="kv">
-        <div><span>当前音源</span><b id="ov-source">—</b></div>
-        <div><span>媒体</span><b id="ov-title">—</b></div>
-        <div><span>采样</span><b id="ov-frames">—</b></div>
-        <div><span>发送端音量</span><b id="ov-volume">—</b></div>
-        <div><span>输出设备</span><b id="ov-devices">—</b></div>
-        <div><span>运行时间</span><b id="ov-uptime">—</b></div>
+<div class="topbar-wrap">
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo" aria-hidden="true">▶</span>
+      <div class="brand-text">
+        <h1>FusionPlay</h1>
+        <p class="sub">AirPlay 2 · DLNA · 小米妙播 · fnOS</p>
       </div>
-      <div id="errors" class="errors hidden"></div>
-    </article>
+    </div>
+    <div class="head-right">
+      <span id="health-dot" class="dot" aria-hidden="true"></span>
+      <span id="health-text" aria-live="polite">连接中…</span>
+      <span id="version-pill" class="pill">v—</span>
+      <button id="refresh-all" class="btn small" type="button">立即刷新</button>
+    </div>
+  </header>
 
-    <article class="card">
-      <div class="card-head"><h2>接收协议</h2><span class="badge" id="protos-badge">—</span></div>
-      <table class="table">
-        <thead><tr><th>协议</th><th>开关</th><th>状态</th><th>详情</th></tr></thead>
-        <tbody id="protocols"><tr><td colspan="4" class="muted">加载中…</td></tr></tbody>
-      </table>
-      <p class="hint">三种协议同一时刻只播放一个主音源，新音源会接管旧音源（旧会话被挂起，不混音）。</p>
-    </article>
+  <nav class="tabs" aria-label="页面导航">
+    <button class="tab" type="button" data-page="overview">概览</button>
+    <button class="tab" type="button" data-page="protocols">接收协议</button>
+    <button class="tab" type="button" data-page="output">音频输出</button>
+    <button class="tab" type="button" data-page="calibration">音频校准</button>
+    <button class="tab" type="button" data-page="settings">设置 / 诊断</button>
+  </nav>
+</div>
+
+<div id="conn-banner" class="banner warn hidden" role="status">
+  <span id="conn-banner-text">无法连接后端服务。</span>
+  <button id="conn-retry" class="btn small" type="button">立即重试</button>
+</div>
+
+<main id="main">
+  <!-- ============================ 概览 ============================ -->
+  <section id="page-overview" class="page hidden" aria-labelledby="overview-title">
+    <div class="page-head">
+      <h2 id="overview-title">概览</h2>
+      <p class="page-sub">实时状态 · 每 2 秒轮询（页面隐藏时暂停）· 数据全部来自后端 API</p>
+    </div>
+
+    <div class="card-grid" id="ov-protocols"></div>
+
+    <div class="grid-2">
+      <article class="card">
+        <div class="card-head">
+          <h3>当前音源与媒体</h3>
+          <span id="ov-source-badge" class="badge">空闲</span>
+        </div>
+        <div class="media">
+          <img id="ov-cover" class="cover hidden" alt="媒体封面" referrerpolicy="no-referrer">
+          <div class="media-body">
+            <div class="kv">
+              <div><span>当前音源</span><b id="ov-source">—</b></div>
+              <div><span>标题</span><b id="ov-title">—</b></div>
+              <div><span>艺术家</span><b id="ov-artist">—</b></div>
+              <div><span>专辑</span><b id="ov-album">—</b></div>
+              <div><span>播放进度</span><b id="ov-position">—</b></div>
+              <div><span>音频格式</span><b id="ov-format">—</b></div>
+              <div><span>引擎采样率</span><b id="ov-engine-rate">—</b></div>
+              <div><span>输出设备采样率</span><b id="ov-device-rate">—</b></div>
+            </div>
+          </div>
+        </div>
+        <p class="hint" id="ov-media-hint">无活动媒体时显示「—」；不提供演示数据。</p>
+      </article>
+
+      <article class="card">
+        <div class="card-head">
+          <h3>发送端逻辑音量 <span class="tag">只读</span></h3>
+        </div>
+        <div class="kv">
+          <div><span>AirPlay 2</span><b id="ov-vol-airplay">—</b></div>
+          <div><span>DLNA</span><b id="ov-vol-dlna">—</b></div>
+          <div><span>小米妙播</span><b id="ov-vol-miplay">—</b></div>
+        </div>
+        <p class="hint">发送端（手机 / 电脑）决定的主音量，仅用于展示。本页不写入、不覆盖发送端音量；NAS 只在其后做输出校准。</p>
+      </article>
+    </div>
+
+    <div class="grid-2">
+      <article class="card">
+        <div class="card-head">
+          <h3>输出设备状态</h3>
+          <span id="ov-device-badge" class="badge">—</span>
+        </div>
+        <div class="table-wrap">
+          <table class="table">
+            <thead>
+              <tr><th>设备</th><th>在线</th><th>状态</th><th>缓冲</th><th>漂移</th><th>underrun</th></tr>
+            </thead>
+            <tbody id="ov-devices">
+              <tr><td colspan="6" class="muted">加载中…</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="hint" id="ov-device-hint">数据来自后端音频引擎；null 后端不上报设备状态时显示「未上报」。</p>
+      </article>
+
+      <article class="card">
+        <div class="card-head">
+          <h3>错误与最近事件</h3>
+          <button id="ov-refresh-logs" class="btn small" type="button">刷新事件</button>
+        </div>
+        <div id="ov-errors" class="errors ok">暂无错误</div>
+        <pre id="ov-events" class="logs">加载中…</pre>
+      </article>
+    </div>
   </section>
 
-  <section class="card">
-    <div class="card-head"><h2>音频输出</h2><div class="head-actions">
-      <button id="refresh-devices" class="btn small">刷新设备</button>
-      <button id="save-audio" class="btn small primary">保存并应用</button>
-    </div></div>
-    <table class="table">
-      <thead><tr><th>启用</th><th>设备</th><th>稳定 ID</th><th>在线</th><th>格式</th><th>缓冲</th><th>漂移</th><th>响度(dB)</th><th>延迟(ms)</th><th>测试</th></tr></thead>
-      <tbody id="devices"><tr><td colspan="10" class="muted">加载中…</td></tr></tbody>
-    </table>
-    <p class="hint">多设备播放同一接收音源；每设备独立缓冲/重采样/漂移补偿。响度范围 −30–0 dB（不提供正增益以避免削波）。</p>
-  </section>
+  <!-- ============================ 接收协议 ============================ -->
+  <section id="page-protocols" class="page hidden" aria-labelledby="protocols-title">
+    <div class="page-head">
+      <h2 id="protocols-title">接收协议</h2>
+      <p class="page-sub">开启 / 关闭协议、广播名称、网络接口与发现状态。保存后写入后端 <code>config.json</code>，并由后端重启协议宿主生效。</p>
+    </div>
 
-  <section class="grid">
-    <article class="card">
-      <div class="card-head"><h2>音频校准</h2><span class="badge" id="cal-mode">发送端主音量</span></div>
-      <p class="hint">以下参数只做输出校准，<b>不会改写发送端显示的主音量</b>。</p>
-      <label class="field"><span>全局输出衰减 <b id="gain-label">100%</b></span>
-        <input type="range" id="global-gain" min="0" max="100" value="100"></label>
-      <label class="field"><span>音量曲线</span>
-        <select id="curve-kind">
-          <option value="linear">线性</option>
-          <option value="soft">柔和</option>
-          <option value="balanced">均衡（默认）</option>
-          <option value="custom">自定义</option>
-        </select></label>
-      <label class="field"><span>自定义控制点（x,y;x,y，0–1，单调）</span>
-        <input id="curve-points" placeholder="0.25,0.15;0.5,0.4;0.75,0.7"></label>
-      <label class="row-inline"><input type="checkbox" id="muted"> 静音输出（发送端仍显示自己的音量）</label>
-      <div class="row"><button id="apply-cal" class="btn primary">应用校准</button><button id="reset-cal" class="btn">恢复默认</button></div>
-      <canvas id="preview" width="480" height="160"></canvas>
-    </article>
+    <div class="card-grid" id="proto-cards"></div>
 
     <article class="card">
-      <div class="card-head"><h2>诊断</h2><div class="head-actions">
-        <select id="log-level"><option>error</option><option>warn</option><option selected>info</option><option>debug</option><option>trace</option></select>
-        <button id="load-diag" class="btn small">刷新</button>
-      </div></div>
-      <div class="kv small">
-        <div><span>音频后端</span><b id="diag-backend">—</b></div>
-        <div><span>网卡</span><b id="diag-ifaces">—</b></div>
-        <div><span>日志文件</span><b id="diag-logpath" class="mono">—</b></div>
-        <div><span>版本</span><b id="diag-version">—</b></div>
+      <div class="card-head">
+        <h3>保存协议设置</h3>
+        <span id="proto-dirty" class="badge warn hidden">有未保存修改</span>
       </div>
-      <pre id="logs" class="logs">加载中…</pre>
+      <div class="row">
+        <button id="save-protocols" class="btn primary" type="button">保存协议设置</button>
+        <button id="reset-protocols" class="btn" type="button">撤销未保存修改</button>
+      </div>
+      <p class="hint">广播名称写入 <code>config.receiver.name</code>，网络接口写入 <code>config.receiver.interface</code>（留空 = 自动选择）。三个协议共用这两项。保存时后端会按新配置<b>重启协议宿主</b>（无需手动重启）；若重启失败，配置可能已写入，本页会明确提示，并可在「设置 / 诊断」查看日志。</p>
+      <div id="proto-error" class="errors hidden"></div>
     </article>
   </section>
 
-  <p class="footer">FusionPlay fnOS · 发送端为主音量，NAS 仅做输出校准 · 参数仅供参考，真机验证项见仓库 AUDIT.md</p>
+  <!-- ============================ 音频输出 ============================ -->
+  <section id="page-output" class="page hidden" aria-labelledby="output-title">
+    <div class="page-head">
+      <h2 id="output-title">音频输出</h2>
+      <p class="page-sub">多设备播放同一音源；每设备独立缓冲、重采样、漂移与延迟补偿。</p>
+    </div>
+
+    <div id="out-gone" class="banner warn hidden"></div>
+
+    <article class="card">
+      <div class="card-head">
+        <h3>输出设备</h3>
+        <div class="head-actions">
+          <span id="out-dirty" class="badge warn hidden">有未保存修改</span>
+          <button id="refresh-devices" class="btn small" type="button">刷新设备</button>
+          <button id="reset-output" class="btn small" type="button">撤销修改</button>
+          <button id="save-output" class="btn small primary" type="button">保存并应用</button>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table class="table output-table">
+          <thead>
+            <tr>
+              <th>启用</th><th>设备</th><th>稳定 ID</th><th>在线</th><th>采样率</th><th>通道</th>
+              <th>默认格式</th><th>响度</th><th>延迟 ms</th><th>缓冲</th><th>漂移</th><th>underrun</th><th>操作</th>
+            </tr>
+          </thead>
+          <tbody id="out-devices">
+            <tr><td colspan="13" class="muted">加载中…</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="hint">响度范围 −30–0 dB（0 = 原始电平，后端不提供正增益以避免削波）；延迟补偿 0–2000 ms；默认格式 = 每设备首选采样率（0 表示跟随设备）。保存时先 <code>PUT /api/config</code>，再 <code>POST /api/devices/refresh</code>。设备消失时保留配置并给出提示，可在此移除。</p>
+      <div id="out-error" class="errors hidden"></div>
+    </article>
+  </section>
+
+  <!-- ============================ 音频校准 ============================ -->
+  <section id="page-calibration" class="page hidden" aria-labelledby="calibration-title">
+    <div class="page-head">
+      <h2 id="calibration-title">音频校准</h2>
+      <p class="page-sub"><b>这些参数不是发送端主音量</b>：只影响 NAS 侧输出增益，不会改写手机 / 电脑上显示的音量。</p>
+    </div>
+
+    <div class="grid-2">
+      <article class="card">
+        <div class="card-head">
+          <h3>全局输出</h3>
+          <span id="cal-dirty" class="badge warn hidden">有未保存修改</span>
+          <span id="cal-status-badge" class="badge">—</span>
+        </div>
+        <label class="field">
+          <span>全局输出衰减：<b id="cal-global-label">100%</b>（0–100，默认 100）</span>
+          <input id="cal-global" type="range" min="0" max="100" step="1" value="100">
+        </label>
+        <label class="check-row">
+          <input id="cal-muted" type="checkbox">
+          <span>静音输出（不改变发送端显示的音量）</span>
+        </label>
+        <label class="field">
+          <span>发送端音量曲线</span>
+          <select id="cal-curve-kind">
+            <option value="linear">线性</option>
+            <option value="soft">柔和</option>
+            <option value="balanced">均衡（默认）</option>
+            <option value="custom">自定义</option>
+          </select>
+        </label>
+        <p class="hint">曲线把发送端逻辑音量（0–100%）映射为输出幅度；总增益 = 曲线 × 全局衰减 × 每设备 dB。后端<b>不支持每设备独立曲线覆盖</b>，仅支持全局曲线 + 每设备 dB / 延迟。</p>
+        <div class="row">
+          <button id="save-cal" class="btn primary" type="button">保存并应用</button>
+          <button id="reset-cal" class="btn" type="button">恢复默认</button>
+        </div>
+        <div id="cal-error" class="errors hidden"></div>
+      </article>
+
+      <article class="card">
+        <div class="card-head">
+          <h3>音量曲线预览</h3>
+          <span id="cal-mode-badge" class="badge">均衡</span>
+        </div>
+        <div class="curve-toolbar">
+          <button id="curve-add" class="btn small" type="button">添加控制点</button>
+          <button id="curve-remove" class="btn small" type="button">删除选中点</button>
+          <button id="curve-reset" class="btn small" type="button">重置曲线</button>
+          <span id="curve-hint" class="hint-inline">选择「自定义」后可拖动</span>
+        </div>
+        <canvas id="curve-canvas" width="640" height="260" tabindex="0" aria-label="发送端音量曲线编辑器（选择自定义曲线后可拖动控制点）"></canvas>
+        <p class="points-line" id="curve-points">控制点：0%, 0% → 100%, 100%（首尾固定）</p>
+        <p class="hint" id="curve-preview-hint">拖动控制点会实时调用 <code>POST /api/calibration/preview</code> 预览；x 与 y 均须单调不减（音量提高时输出不能下降）。</p>
+      </article>
+    </div>
+
+    <article class="card">
+      <div class="card-head">
+        <h3>每设备响度与延迟</h3>
+        <span class="badge">仅全局曲线</span>
+      </div>
+      <p class="hint">仅对「音频输出」页已配置的设备生效。当前后端 API 不提供每设备曲线覆盖，本页不会伪造该能力；保存与全局参数一并提交（<code>PUT /api/calibration</code>）。</p>
+      <div class="table-wrap">
+        <table class="table">
+          <thead>
+            <tr><th>设备</th><th>稳定 ID</th><th>启用</th><th>响度 dB</th><th>延迟 ms</th></tr>
+          </thead>
+          <tbody id="cal-devices"></tbody>
+        </table>
+      </div>
+      <div id="cal-device-empty" class="muted hidden">尚未配置输出设备，请先在「音频输出」页选择并保存。</div>
+    </article>
+  </section>
+
+  <!-- ============================ 设置 / 诊断 ============================ -->
+  <section id="page-settings" class="page hidden" aria-labelledby="settings-title">
+    <div class="page-head">
+      <h2 id="settings-title">设置 / 诊断</h2>
+      <p class="page-sub">版本与运行状态、日志、配置导入导出、网络接口与 ALSA 诊断。</p>
+    </div>
+
+    <div class="grid-2">
+      <article class="card">
+        <div class="card-head">
+          <h3>版本与构建</h3>
+          <button id="refresh-diag" class="btn small" type="button">刷新</button>
+        </div>
+        <div class="kv small">
+          <div><span>版本</span><b id="set-version">—</b></div>
+          <div><span>运行时长</span><b id="set-uptime">—</b></div>
+          <div><span>音频后端</span><b id="set-backend">—</b></div>
+          <div><span>协议宿主</span><b id="set-protocols">—</b></div>
+          <div><span>日志文件</span><b id="set-logpath" class="mono">—</b></div>
+          <div><span>构建信息</span><b id="set-build">—</b></div>
+        </div>
+        <p class="hint">后端仅暴露包版本号（<code>CARGO_PKG_VERSION</code>），没有独立 git 构建号字段；此处不显示猜测值。</p>
+      </article>
+
+      <article class="card">
+        <div class="card-head">
+          <h3>运行状态</h3>
+          <span id="set-health" class="badge">—</span>
+        </div>
+        <div class="kv small">
+          <div><span>当前音源</span><b id="set-source">—</b></div>
+          <div><span>主混音帧数</span><b id="set-frames">—</b></div>
+          <div><span>丢弃帧数</span><b id="set-dropped">—</b></div>
+          <div><span>输出设备</span><b id="set-devices">—</b></div>
+          <div><span>累计 underrun</span><b id="set-underruns">—</b></div>
+          <div><span>日志级别</span><b id="set-level">—</b></div>
+        </div>
+        <div id="set-errors" class="errors ok">暂无错误</div>
+      </article>
+    </div>
+
+    <article class="card">
+      <div class="card-head">
+        <h3>日志</h3>
+        <div class="head-actions">
+          <select id="log-level" aria-label="日志级别">
+            <option value="error">error</option>
+            <option value="warn">warn</option>
+            <option value="info">info</option>
+            <option value="debug">debug</option>
+            <option value="trace">trace</option>
+          </select>
+          <button id="apply-log-level" class="btn small" type="button">应用级别</button>
+          <label class="check-row inline"><input id="logs-auto" type="checkbox" checked> <span>自动刷新</span></label>
+          <button id="refresh-logs" class="btn small" type="button">刷新</button>
+        </div>
+      </div>
+      <pre id="logs" class="logs" tabindex="0">加载中…</pre>
+      <p class="hint" id="logs-hint">显示后端最近日志（最多 200 行，来自 <code>GET /api/logs</code>）；日志文件达上限后端会自动轮转。</p>
+    </article>
+
+    <div class="grid-2">
+      <article class="card">
+        <div class="card-head">
+          <h3>配置导入 / 导出</h3>
+        </div>
+        <div class="row">
+          <button id="export-config" class="btn" type="button">导出配置（JSON 下载）</button>
+          <label class="btn file-btn" for="import-file">导入配置（选择文件）</label>
+          <input id="import-file" type="file" accept="application/json,.json" hidden>
+        </div>
+        <p class="hint">导出调用 <code>GET /api/export</code> 并下载 JSON；导入调用 <code>POST /api/import</code>，成功后立即落盘、应用音频配置并由后端重启协议宿主。</p>
+        <div id="config-summary" class="kv small"></div>
+        <div id="import-error" class="errors hidden"></div>
+      </article>
+
+      <article class="card">
+        <div class="card-head">
+          <h3>网络接口 / ALSA 诊断</h3>
+          <button id="refresh-diag2" class="btn small" type="button">刷新诊断</button>
+        </div>
+        <div class="kv small">
+          <div><span>音频后端</span><b id="diag-backend">—</b></div>
+          <div><span>日志文件</span><b id="diag-logpath" class="mono">—</b></div>
+        </div>
+        <p class="sub-label">网络接口（来自 /sys/class/net）</p>
+        <div id="diag-interfaces" class="chips">—</div>
+        <p class="sub-label">/proc/asound/cards</p>
+        <pre id="diag-cards" class="logs small-pre">—</pre>
+        <p class="sub-label">/proc/asound/pcm</p>
+        <pre id="diag-pcm" class="logs small-pre">—</pre>
+      </article>
+    </div>
+  </section>
 </main>
+
+<footer class="footer">
+  FusionPlay fnOS · 发送端决定主音量，NAS 仅做输出校准 · 所有状态来自后端 JSON API，无演示数据
+</footer>
+
+<div id="toast" class="toast" role="status" aria-live="polite"></div>
+
+<noscript><p class="banner warn">此管理界面需要启用 JavaScript。</p></noscript>
 <script src="app.js"></script>
 </body>
 </html>

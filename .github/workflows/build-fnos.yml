@@ -1,10 +1,21 @@
 name: Build fnOS FPK
 
+# 触发：
+#   - workflow_dispatch：手动出包
+#   - push tags `fnos-*`：打 tag 时出包并附到 GitHub Release
 on:
   workflow_dispatch:
   push:
     tags:
       - 'fnos-*'
+
+# softprops/action-gh-release 需要写权限；默认 GITHUB_TOKEN 只读，不加会 403。
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
 
 jobs:
   build-fnos:
@@ -14,54 +25,96 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install ALSA build dependencies
+      # Rust 侧依赖：cpal → alsa-sys 需要 libasound2-dev + pkg-config；
+      # build-essential/cmake 给可能存在的 C 依赖兜底；iproute2/procps/python3 给沙箱模拟脚本用。
+      - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends libasound2-dev pkg-config tar
+          sudo apt-get install -y --no-install-recommends \
+            libasound2-dev pkg-config build-essential cmake \
+            curl tar iproute2 procps python3
+          echo "ALSA: $(pkg-config --modversion alsa)"
 
-      - name: Set up Rust
+      - name: Set up Rust (stable)
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache cargo
+      - name: Cache cargo registry and target dirs
         uses: actions/cache@v4
         with:
           path: |
-            ~/.cargo/registry
-            ~/.cargo/git
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
             fnos/backend/target
             src/AirPlayReceiver.Core/target
-          key: ${{ runner.os }}-fnos-cargo-${{ hashFiles('fnos/backend/Cargo.toml', 'src/AirPlayReceiver.Core/Cargo.toml', 'src/FusionPlay.MiPlaySdk/Cargo.toml', 'vendor/shairplay/Cargo.toml') }}
+            src/FusionPlay.MiPlaySdk/target
+            vendor/shairplay/target
+          # key 必须覆盖所有 Cargo.lock/Cargo.toml，否则依赖变化会命中旧缓存
+          key: ${{ runner.os }}-fnos-cargo-${{ hashFiles('fnos/backend/Cargo.lock', 'fnos/backend/Cargo.toml', 'src/AirPlayReceiver.Core/Cargo.lock', 'src/AirPlayReceiver.Core/Cargo.toml', 'src/FusionPlay.MiPlaySdk/Cargo.lock', 'src/FusionPlay.MiPlaySdk/Cargo.toml', 'src/FusionPlay.AndroidIfAddrs/Cargo.lock', 'vendor/shairplay/Cargo.toml') }}
           restore-keys: |
             ${{ runner.os }}-fnos-cargo-
 
-      - name: Backend unit tests (mock audio, no hardware)
+      - name: Toolchain sanity check
+        run: |
+          rustc --version
+          cargo --version
+          chmod +x fnos/tools/fnpack-linux-amd64
+          fnos/tools/fnpack-linux-amd64 --help | head -5
+
+      # 后端单测使用 null 音频后端（CI 无声卡），不会打开真实 /dev/snd。
+      # （audio_engine_mock 的 drift 断言已改为串行 + 稳定不变量 + 确定性收敛测试，不再 flaky）
+      - name: Backend unit tests (null audio, no hardware)
+        timeout-minutes: 20
         run: cargo test --manifest-path fnos/backend/Cargo.toml --all-targets
 
-      - name: Protocol core tests (AirPlay 2 / DLNA / MiPlay reuse)
+      # 复用的协议核心：AirPlay 2 / DLNA 控制面。个别用例可能依赖本机网络栈，
+      # 加 step 级超时避免个别用例挂住整个 job（job 总时长仍受 90min 约束）。
+      - name: Protocol core tests (AirPlay 2 / DLNA reuse)
+        timeout-minutes: 20
         run: |
           cargo test --manifest-path src/AirPlayReceiver.Core/Cargo.toml --lib
-          cargo test --manifest-path src/FusionPlay.MiPlaySdk/Cargo.toml --lib
+          cargo test --manifest-path src/AirPlayReceiver.Core/Cargo.toml --test external_output
+
+      - name: MiPlay SDK tests
+        timeout-minutes: 20
+        run: cargo test --manifest-path src/FusionPlay.MiPlaySdk/Cargo.toml --lib
 
       - name: Build release binary
+        timeout-minutes: 20
         run: cargo build --release --manifest-path fnos/backend/Cargo.toml
 
-      - name: Package FPK
-        run: |
-          chmod +x fnos/tools/fnpack-linux-amd64
-          ./fnos/tools/build-fpk.sh
+      # build-fpk 内含守卫：manifest.version == backend Cargo.toml version == 二进制 --version、
+      # platform 与构建架构一致、service_port 与 cmd/main 默认一致、fnpack 输出含 "Packing successfully"。
+      - name: Build FPK
+        timeout-minutes: 15
+        run: ./fnos/tools/build-fpk.sh
 
-      - name: Verify FPK structure
+      - name: Check FPK structure and fnOS spec
         run: ./fnos/tools/check-fpk.sh fnos/dist/fusionplay-fnos.fpk
+
+      # 沙箱模拟：install_init → install_callback → main start → status=0 → /healthz → stop → status=3
+      # 使用随机端口 + 临时目录，不碰 NAS/真机；音频后端强制 null。
+      - name: Simulate install lifecycle (sandboxed)
+        timeout-minutes: 10
+        run: ./fnos/tools/simulate-install.sh fnos/dist/fusionplay-fnos.fpk
+
+      # 升级回归：临时重建一个 +1 版本的二进制并 repack，验证
+      # upgrade_init 停服务/释放端口/删 PID、upgrade_callback 重新拉起新版本、孤儿进程也能被清理。
+      - name: Simulate upgrade path (rebuilds a +1 version fixture)
+        timeout-minutes: 25
+        run: ./fnos/tools/simulate-upgrade.sh fnos/dist/fusionplay-fnos.fpk
 
       - name: Upload FPK artifact
         uses: actions/upload-artifact@v4
         with:
           name: fusionplay-fnos-fpk
-          path: fnos/dist/*.fpk
+          path: fnos/dist/fusionplay-fnos.fpk
           if-no-files-found: error
+          retention-days: 30
 
-      - name: Attach FPK to release
+      - name: Attach FPK to release (tag pushes)
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: fnos/dist/*.fpk
+          files: fnos/dist/fusionplay-fnos.fpk
+          generate_release_notes: true
