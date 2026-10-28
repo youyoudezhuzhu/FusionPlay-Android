@@ -1,4 +1,5 @@
 import org.gradle.api.tasks.testing.Test
+import java.io.File
 
 plugins {
     id("com.android.application")
@@ -17,7 +18,7 @@ val generatedNativeLibs = layout.buildDirectory.dir("generated/fusionPlayJniLibs
 // builds) we keep the historical debug-key fallback.
 val releaseKeystorePath: String? = System.getenv("ANDROID_KEYSTORE_PATH")
 val releaseKeystoreFile: java.io.File? =
-    releaseKeystorePath?.let { path -> java.io.File(path).takeIf { it.isFile } }
+    releaseKeystorePath?.let { path -> File(path).takeIf { it.isFile } }
 
 android {
     namespace = "com.fusionplay.android"
