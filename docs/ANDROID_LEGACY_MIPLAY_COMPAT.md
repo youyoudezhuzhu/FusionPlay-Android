@@ -34,7 +34,7 @@ GitHub Actions（推荐，Linux 上产 release APK）：
 gh workflow run android.yml --repo youyoudezhuzhu/FusionPlay-Android --ref compat/android-legacy-miplay
 ```
 
-产物：`FusionPlay-Android-APK` artifact 里的 `FusionPlay-Android-1.2.5.apk`
+产物：`FusionPlay-Android-APK` artifact 里的 APK（1.2.5 起默认启用；1.2.6 起同时改为 AirPlay 音响身份广播，见 `docs/AIRPLAY_AUDIO_ONLY.md`）
 （Flutter 默认用 debug keystore 签名，可直接安装；覆盖安装需卸载旧版以更换签名）。
 
 本机标准构建流程见仓库 README（Flutter 3.32.8 / Android SDK 36 / NDK 28.2.13676358 /

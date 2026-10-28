@@ -144,6 +144,23 @@ pub fn receiver_features() -> u64 {
     receiver_features_for_pairing(false)
 }
 
+/// Features for an audio-only receiver.
+///
+/// Same known-good AP2 audio profile as [`receiver_features_for_pairing`], but
+/// the `hls` build's optional video/HLS bits (bit 0 = AirPlay video v1,
+/// bit 4 = HTTP Live Streaming) are **not** advertised. Smartphones then treat
+/// the receiver as an audio device instead of a TV/screen target.
+pub(crate) fn receiver_features_for_pairing_with(
+    requires_pin_pairing: bool,
+    audio_only: bool,
+) -> u64 {
+    let mut features = receiver_features_for_pairing(requires_pin_pairing);
+    if audio_only {
+        features &= !((1u64 << 0) | (1u64 << 4));
+    }
+    features
+}
+
 /// Features for an audio-only AirPlay 2 receiver with explicit pairing mode.
 ///
 /// The default receiver profile mirrors shairport-sync and supports transient

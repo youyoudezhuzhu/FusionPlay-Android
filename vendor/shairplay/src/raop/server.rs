@@ -74,6 +74,9 @@ pub struct RaopServerBuilder {
     video_handler: Option<Arc<dyn crate::raop::video::VideoHandler>>,
     #[cfg(feature = "hls")]
     hls_handler: Option<Arc<dyn crate::raop::hls::HlsHandler>>,
+    /// Advertise as an audio-only AirPlay 2 speaker (audio-only model + no
+    /// video/HLS feature bits) instead of the video-capable Apple TV profile.
+    audio_only: bool,
 }
 
 impl Default for RaopServerBuilder {
@@ -103,6 +106,7 @@ impl RaopServerBuilder {
             video_handler: None,
             #[cfg(feature = "hls")]
             hls_handler: None,
+            audio_only: false,
         }
     }
 
@@ -195,6 +199,17 @@ impl RaopServerBuilder {
         self
     }
 
+    /// Advertise this receiver as an audio-only speaker.
+    ///
+    /// Uses the audio-only AirPlay model (`AirPort10,115`) and clears the
+    /// video/HLS feature bits added by the `hls` build, so iPhones offer it as
+    /// an audio output instead of a TV / video target. The HLS control path
+    /// stays compiled but is no longer advertised.
+    pub fn audio_only(mut self, audio_only: bool) -> Self {
+        self.audio_only = audio_only;
+        self
+    }
+
     /// Build the server with the given audio handler.
     pub fn build(self, handler: Arc<dyn AudioHandler>) -> Result<RaopServer, ShairplayError> {
         if self.max_clients == 0 {
@@ -284,6 +299,7 @@ impl RaopServerBuilder {
             hwaddr,
             #[cfg(feature = "ap2")]
             mode: self.mode,
+            audio_only: self.audio_only,
         })
     }
 }
@@ -302,6 +318,8 @@ pub struct RaopServer {
     hwaddr: Vec<u8>,
     #[cfg(feature = "ap2")]
     mode: AirPlayMode,
+    /// Audio-only advertisement profile (see [`RaopServerBuilder::audio_only`]).
+    audio_only: bool,
 }
 
 /// Weak, cloneable control handle for stopping active media without shutting
@@ -411,7 +429,7 @@ impl RaopServer {
                 let (_, vk) = crate::crypto::pairing_homekit::identity_keypair(&self.shared.identity_seed);
                 let pk_hex: String = vk.as_bytes().iter().map(|b| format!("{b:02x}")).collect();
                 let pi = self.shared.pairing_id.clone();
-                return AirPlayServiceInfo::new_airplay2(
+                return AirPlayServiceInfo::new_airplay2_with_profile(
                     &self.name,
                     self.httpd.port(),
                     &self.hwaddr,
@@ -420,14 +438,16 @@ impl RaopServer {
                     &pi,
                     self.shared.pin.is_some(),
                     self.shared.pairing_store.has_any_pairing(),
+                    self.audio_only,
                 );
             }
         }
-        AirPlayServiceInfo::new(
+        AirPlayServiceInfo::new_with_profile(
             &self.name,
             self.httpd.port(),
             &self.hwaddr,
             !self.shared.password.is_empty(),
+            self.audio_only,
         )
     }
 }

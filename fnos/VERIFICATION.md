@@ -344,3 +344,45 @@ GitHub Actions（tag `fnos-v0.2.3` → commit `ea29bd8`）：
   sha256 `d5ba44a91e8678197c6e3417d646e0f09a3b722f6d49a7d42d0321f70cf1f51a`。
 - Release：<https://github.com/youyoudezhuzhu/FusionPlay-Android/releases/tag/fnos-v0.2.3>。
 - 工作区副本：`artifacts/FusionPlay-fnos-0.2.3-x86.fpk`。
+
+---
+
+## 12. v0.2.4：妙播旧版兼容补丁 + AirPlay 音响身份
+
+### 12.1 问题
+
+1. **妙播旧平板投送失败**：Android 端默认调用
+   `fusionplay_miplay_sdk::media::enable_legacy_fixed_media_compatibility()`（7d3cf88/8af8545），
+   但 fnOS 后端从未调用，导致“发送端未宣告 0x6c 会话密钥、PES 带私有 IV”的旧版媒体链路失败。
+2. **AirPlay 被识别成 TV**：`shairplay` 的 `hls` 构建会给 `features` 加上
+   bit 0（video v1）/ bit 4（HLS），且 `model=AppleTV6,2`，iPhone 因此把接收器当成
+   视频目标（播放视频时会尝试投送）；而 FusionPlay 只输出音频。
+
+### 12.2 修复
+
+- fnOS `start_miplay()` 默认调用 `enable_legacy_fixed_media_compatibility()`；
+  在 `$TRIM_PKGVAR/disable-legacy-fixed-media` 放置标记文件可关闭（与 Android 同机制）。
+  启动日志输出「小米妙播旧版固定密钥媒体兼容：启用」。
+- `vendor/shairplay` 新增 `RaopServerBuilder::audio_only(bool)`：
+  - 模型 `AirPort10,115`，清除 video v1/HLS feature 位，`_device-info` 不再带 `osxvers`；
+  - AP1 profile features 由 `0x7` 改为 `0x200`（audio-only）。
+- **Android 同步**：JNI `Settings.airplay_audio_only = true`，不再把手机当 TV 视频目标；
+  fnOS 同样 `airplay_audio_only = true`。Xcode/桌面 headless 默认仍保持原行为。
+- Android 版本 `1.2.5 → 1.2.6`；fnOS `0.2.3 → 0.2.4`。
+
+### 12.3 验证
+
+- shairplay（`--features hls`）：**171 passed**，含 audio-only profile 的
+  model/features/device-info 断言。
+- core 82 + 1、MiPlay 93、backend 61 passed / 1 ignored。
+- 真机 mDNS（`avahi-browse`）：
+  `_airplay._tcp` → `model=AirPort10,115`，`features=0x405D4A00,0x1C340`（bit0/bit4 已清除），
+  `_raop._tcp` → `am=AirPort10,115`、`ft=0x405D4A00,0x1C340`；仍是 AirPlay 2（vv=2/protovers=1.1）。
+- fnOS 妙播测试实例日志确认兼容补丁已启用，状态 `waiting`。
+- FPK `0.2.4` 构建 + check-fpk、simulate-install **63/63**、simulate-upgrade **46/46**。
+- 待真机：iPhone 控制中心应显示为音响且不再出现视频/镜像；旧 HyperOS 平板实际投放。
+
+### 12.4 主线更新
+
+`fnos/fpk` 合入 `main`（fast-forward），main 上的 Android CI 将重新构建 `1.2.6` APK
+（包含妙播兼容 + AirPlay 音响身份）。CI 运行与产物哈希见发布记录。

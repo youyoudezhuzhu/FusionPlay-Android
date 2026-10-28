@@ -357,6 +357,9 @@ impl ProtocolHosts {
             output_device: None,
             airplay_enabled: config.protocols.airplay.enabled,
             dlna_enabled: config.protocols.dlna.enabled,
+            // fnOS is an audio receiver: advertise the audio-only AirPlay
+            // profile so iPhones do not offer video/AirPlay mirroring to it.
+            airplay_audio_only: true,
             audio_output: Some(sink),
         };
         let state_for_thread = Arc::clone(&self.state);
@@ -388,6 +391,18 @@ impl ProtocolHosts {
     }
 
     fn start_miplay(&self, config: &Config, state_dir: &Path) -> Result<()> {
+        // Android enables the legacy fixed-key media compatibility by default
+        // (commit 7d3cf88/8af8545). fnOS must do the same or older HyperOS
+        // senders (no 0x6c session key, PES private IV) fail to play. Opt-out
+        // is the same marker file the Android app uses.
+        let legacy_compat = !state_dir.join("disable-legacy-fixed-media").is_file();
+        if legacy_compat {
+            fusionplay_miplay_sdk::media::enable_legacy_fixed_media_compatibility();
+        }
+        tracing::info!(
+            "小米妙播旧版固定密钥媒体兼容：{}",
+            if legacy_compat { "启用" } else { "已通过标记文件关闭" }
+        );
 
         let (interface, ip, mac) = pick_interface(&config.receiver.interface)?;
         let identity = load_identity(state_dir)?;

@@ -1,6 +1,6 @@
 # FusionPlay fnOS 安装与验收指南
 
-面向最终用户/测试同学。安装包：`fusionplay-fnos.fpk`（appname `fusionplay-fnos`，当前 `0.2.3`，x86_64）。
+面向最终用户/测试同学。安装包：`fusionplay-fnos.fpk`（appname `fusionplay-fnos`，当前 `0.2.4`，x86_64）。
 构建、CI 与本地沙箱测试见 [fnos-build.md](fnos-build.md)；功能与限制见 [README.md](README.md)。
 
 ## 0. 前置条件
@@ -81,7 +81,7 @@ sudo -u fusionplay-fnos test -r /dev/snd/controlC0 && echo "audio ok" || echo "a
 ### 4.1 应用状态与服务
 
 ```bash
-trim-cli app status fusionplay-fnos          # status: running，version = 0.2.3
+trim-cli app status fusionplay-fnos          # status: running，version = 0.2.4
 sudo ss -lntp | grep 18080                   # 127.0.0.1:18080 有监听
 pgrep -af 'fusionplay-fnos/bin/fusionplay-fnos'   # 只有 1 个进程
 ```
@@ -90,7 +90,7 @@ pgrep -af 'fusionplay-fnos/bin/fusionplay-fnos'   # 只有 1 个进程
 
 ```bash
 curl -s http://127.0.0.1:18080/healthz
-# 期望：{"status":"ok","version":"0.2.3","uptime":...}
+# 期望：{"status":"ok","version":"0.2.4","uptime":...}
 
 # 走网关 socket（应用实际接法；路径经 /var/apps/.../target 软链）
 curl -s --unix-socket /var/apps/fusionplay-fnos/target/fusionplay-fnos.sock \
@@ -128,7 +128,7 @@ sudo tail -n 100 /vol1/@appdata/fusionplay-fnos/fusionplay.log
 sudo tail -n 100 /vol1/@appdata/fusionplay-fnos/app.log
 ```
 
-期望：有 `FusionPlay fnOS 0.2.3 启动`、`HTTP 已启动`、`协议宿主已启动`；
+期望：有 `FusionPlay fnOS 0.2.4 启动`、`HTTP 已启动`、`协议宿主已启动`；
 没有反复重启/崩溃堆栈。日志超过 5 MiB 会原地保留尾部 1 MiB（inode 不变）。
 
 ### 4.6 数据与配置目录

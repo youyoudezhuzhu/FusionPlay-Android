@@ -84,6 +84,9 @@ impl AndroidCoreProtocol {
             output_device,
             airplay_enabled: self == Self::AirPlay,
             dlna_enabled: self == Self::Dlna,
+            // FusionPlay is an audio receiver: advertise the audio-only
+            // AirPlay profile so iPhones do not offer video/mirroring.
+            airplay_audio_only: true,
             audio_output: None,
         }
     }

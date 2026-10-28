@@ -45,6 +45,11 @@ pub(crate) const RAOP_AP2_VN: &str = "65537";
 pub(crate) const GLOBAL_FEATURES: u32 = 0x7;
 /// Device model identifier.
 pub(crate) const GLOBAL_MODEL: &str = crate::raop::config::GLOBAL_MODEL;
+
+/// Audio-only model identifier (2nd-gen AirPort Express, AirPlay 2 audio-only).
+/// Smartphones show this receiver as a speaker, not as an Apple TV / video
+/// target; the model is what iOS uses for the device icon and video choices.
+pub(crate) const AUDIO_ONLY_MODEL: &str = "AirPort10,115";
 /// Software version string.
 pub(crate) const GLOBAL_VERSION: &str = "130.14";
 /// Darwin major version corresponding to the advertised macOS 15 profile.
@@ -89,6 +94,17 @@ pub struct AirPlayServiceInfo {
 impl AirPlayServiceInfo {
     /// Create AP1 service info for mDNS registration.
     pub fn new(name: &str, port: u16, hwaddr: &[u8], password: bool) -> Self {
+        Self::new_with_profile(name, port, hwaddr, password, false)
+    }
+
+    /// Create AP1 service info with an explicit audio-only profile.
+    pub fn new_with_profile(
+        name: &str,
+        port: u16,
+        hwaddr: &[u8],
+        password: bool,
+        audio_only: bool,
+    ) -> Self {
         let hw_raop = util::hwaddr_raop(hwaddr);
         let hw_airplay = util::hwaddr_airplay(hwaddr);
         let raop_name = format!("{hw_raop}@{name}");
@@ -111,15 +127,19 @@ impl AirPlayServiceInfo {
             ("ek".into(), RAOP_EK.into()),
         ];
 
+        let model = if audio_only { AUDIO_ONLY_MODEL } else { GLOBAL_MODEL };
+        // 0x7 advertises AirPlay video/photo; an audio-only receiver must only
+        // advertise the audio feature bit (bit 9).
+        let features = if audio_only { 1u32 << 9 } else { GLOBAL_FEATURES };
         let airplay_txt = vec![
             ("deviceid".into(), hw_airplay),
-            ("features".into(), format!("0x{GLOBAL_FEATURES:x}")),
-            ("model".into(), GLOBAL_MODEL.into()),
+            ("features".into(), format!("0x{features:x}")),
+            ("model".into(), model.into()),
         ];
-        let device_info_txt = vec![
-            ("model".into(), GLOBAL_MODEL.into()),
-            ("osxvers".into(), DEVICE_INFO_OSX_VERSION.into()),
-        ];
+        let mut device_info_txt = vec![("model".into(), model.to_string())];
+        if !audio_only {
+            device_info_txt.push(("osxvers".into(), DEVICE_INFO_OSX_VERSION.into()));
+        }
 
         Self {
             raop_name,
@@ -145,11 +165,42 @@ impl AirPlayServiceInfo {
         requires_pin_pairing: bool,
         already_paired: bool,
     ) -> Self {
+        Self::new_airplay2_with_profile(
+            name,
+            port,
+            hwaddr,
+            password,
+            pk_hex,
+            pi,
+            requires_pin_pairing,
+            already_paired,
+            false,
+        )
+    }
+
+    /// Create AP2 service info with an explicit audio-only profile.
+    #[cfg(feature = "ap2")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_airplay2_with_profile(
+        name: &str,
+        port: u16,
+        hwaddr: &[u8],
+        password: bool,
+        pk_hex: &str,
+        pi: &str,
+        requires_pin_pairing: bool,
+        already_paired: bool,
+        audio_only: bool,
+    ) -> Self {
         let hw_raop = util::hwaddr_raop(hwaddr);
         let hw_airplay = util::hwaddr_airplay(hwaddr);
         let raop_name = format!("{hw_raop}@{name}");
 
-        let features = super::features::receiver_features_for_pairing(requires_pin_pairing);
+        let features = super::features::receiver_features_for_pairing_with(
+            requires_pin_pairing,
+            audio_only,
+        );
+        let model = if audio_only { AUDIO_ONLY_MODEL } else { GLOBAL_MODEL };
         let features_lo = features & 0xFFFFFFFF;
         let features_hi = (features >> 32) & 0xFFFFFFFF;
         let ft = format!("0x{features_lo:X},0x{features_hi:X}");
@@ -166,7 +217,7 @@ impl AirPlayServiceInfo {
             ("fv".into(), AP2_FW_VERSION.into()),
             ("sf".into(), format!("0x{status_flags:X}")),
             ("md".into(), RAOP_MD.into()),
-            ("am".into(), GLOBAL_MODEL.into()),
+            ("am".into(), model.into()),
             ("pk".into(), pk_hex.into()),
             ("tp".into(), RAOP_TP.into()), // TCP for AP1 fallback, UDP for AP2
             ("vn".into(), RAOP_AP2_VN.into()),
@@ -183,7 +234,7 @@ impl AirPlayServiceInfo {
             ("gid".into(), pi.into()),
             ("igl".into(), "0".into()),
             ("gcgl".into(), "0".into()),
-            ("model".into(), GLOBAL_MODEL.into()),
+            ("model".into(), model.into()),
             ("protovers".into(), AP2_PROTOVERS.into()),
             ("pi".into(), pi.into()),
             ("pk".into(), pk_hex.into()),
@@ -192,10 +243,10 @@ impl AirPlayServiceInfo {
             ("vv".into(), "2".into()),
             ("fv".into(), AP2_FW_VERSION.into()),
         ];
-        let device_info_txt = vec![
-            ("model".into(), GLOBAL_MODEL.into()),
-            ("osxvers".into(), DEVICE_INFO_OSX_VERSION.into()),
-        ];
+        let mut device_info_txt = vec![("model".into(), model.to_string())];
+        if !audio_only {
+            device_info_txt.push(("osxvers".into(), DEVICE_INFO_OSX_VERSION.into()));
+        }
 
         Self {
             raop_name,
@@ -477,6 +528,54 @@ mod tests {
         assert!(find("pi").is_some());
         assert!(find("pk").is_some());
         assert_eq!(find("vv"), Some("2"));
+    }
+
+    #[test]
+    fn audio_only_profile_advertises_speaker_model_without_video_bits() {
+        let info = AirPlayServiceInfo::new_airplay2_with_profile(
+            "NAS Speaker",
+            7000,
+            &[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF],
+            false,
+            "abcd1234",
+            "my-uuid-here",
+            false,
+            false,
+            true,
+        );
+        let find = |records: &[(String, String)], key: &str| {
+            records.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str().to_string())
+        };
+        // Audio-only model: iOS renders a speaker (AirPort Express), not a TV.
+        assert_eq!(find(&info.airplay_txt, "model").as_deref(), Some("AirPort10,115"));
+        assert_eq!(find(&info.raop_txt, "am").as_deref(), Some("AirPort10,115"));
+        assert_eq!(find(&info.device_info_txt, "model").as_deref(), Some("AirPort10,115"));
+        assert!(find(&info.device_info_txt, "osxvers").is_none(), "audio-only must not advertise a macOS hint");
+        let features_txt = find(&info.airplay_txt, "features").expect("features");
+        let mut parts = features_txt.split(',');
+        let lo = u64::from_str_radix(parts.next().unwrap().trim_start_matches("0x"), 16).unwrap();
+        let hi = u64::from_str_radix(parts.next().unwrap().trim_start_matches("0x"), 16).unwrap();
+        let features = lo | (hi << 32);
+        assert_ne!(features & (1 << 9), 0, "audio feature must stay");
+        assert_ne!(features & (1u64 << 40), 0, "AP2 buffered audio must stay");
+        assert_eq!(features & (1 << 0), 0, "AirPlay video v1 must be cleared");
+        assert_eq!(features & (1 << 4), 0, "HLS video must be cleared");
+        assert_eq!(
+            find(&info.raop_txt, "ft").as_deref(),
+            Some(features_txt.as_str()),
+            "raop ft and airplay features stay consistent"
+        );
+
+        // Classic AP1 profile also switches model and drops the video bits.
+        let ap1 = AirPlayServiceInfo::new_with_profile(
+            "NAS Speaker",
+            7000,
+            &[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF],
+            false,
+            true,
+        );
+        assert_eq!(find(&ap1.airplay_txt, "model").as_deref(), Some("AirPort10,115"));
+        assert_eq!(find(&ap1.airplay_txt, "features").as_deref(), Some("0x200"));
     }
 
     #[test]

@@ -23,6 +23,10 @@ pub struct Settings {
     pub output_device: Option<String>,
     pub airplay_enabled: bool,
     pub dlna_enabled: bool,
+    /// Advertise AirPlay as an audio-only speaker (AirPort10,115 model, no
+    /// video/HLS feature bits). fnOS sets this so iPhones stop offering video.
+    /// Android/desktop keep the existing video-capable Apple TV profile.
+    pub airplay_audio_only: bool,
     /// Host-installed unified output (fnOS). `None` keeps cpal/Oboe output.
     pub audio_output: Option<std::sync::Arc<dyn PcmOutput>>,
 }
@@ -37,6 +41,7 @@ impl std::fmt::Debug for Settings {
             .field("output_device", &self.output_device)
             .field("airplay_enabled", &self.airplay_enabled)
             .field("dlna_enabled", &self.dlna_enabled)
+            .field("airplay_audio_only", &self.airplay_audio_only)
             .field("audio_output", &self.audio_output.as_ref().map(|_| "external"))
             .finish()
     }
@@ -252,6 +257,7 @@ pub async fn run_receiver_with_arbiter(
             .pairing_store(pairing_store)
             .output_sample_rate(audio.sample_rate)
             .output_max_channels(audio.channels.min(u8::MAX as u16) as u8)
+            .audio_only(settings.airplay_audio_only)
             .hls_handler(video_bridge.clone());
         if let Some(pin) = &settings.pin {
             builder = builder.pin(pin.clone());
@@ -614,6 +620,7 @@ pub fn parse_settings_from(arguments: impl IntoIterator<Item = String>) -> Resul
         output_device,
         airplay_enabled,
         dlna_enabled,
+        airplay_audio_only: false,
         audio_output: None,
     })
 }
