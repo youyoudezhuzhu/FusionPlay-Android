@@ -333,3 +333,14 @@ Android 版设置页可选择妙播设备身份（`vehicle` 车机 / `television
   默认电视、四个选项、点击车机出现保存栏、保存后 `GET /api/config` 为 `vehicle`、
   妙播重启为 `waiting`、接收页与概览图标切为 `#icon-device-vehicle`、服务端持久化、无运行错误。
 - FPK `0.2.3` 构建 + check-fpk 通过；`simulate-install` **63/63**、`simulate-upgrade` **46/46**。
+
+### 11.4 CI 与产物
+
+GitHub Actions（tag `fnos-v0.2.3` → commit `ea29bd8`）：
+[run 40667398529](https://github.com/youyoudezhuzhu/FusionPlay-Android/actions/runs/40667398529)
+全步骤 success。
+
+- CI artifact（本地复验通过）：`fusionplay-fnos.fpk`，3,850,868 B，
+  sha256 `d5ba44a91e8678197c6e3417d646e0f09a3b722f6d49a7d42d0321f70cf1f51a`。
+- Release：<https://github.com/youyoudezhuzhu/FusionPlay-Android/releases/tag/fnos-v0.2.3>。
+- 工作区副本：`artifacts/FusionPlay-fnos-0.2.3-x86.fpk`。
