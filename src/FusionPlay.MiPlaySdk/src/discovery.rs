@@ -156,6 +156,7 @@ impl MiPlayAdvertisement {
         local_ip: Ipv4Addr,
         interface_name: &str,
         diagnostic_multicast_loopback: bool,
+        retired_receiver_names: &[String],
         events: EventEmitter,
     ) -> Result<Self> {
         let protocol_name = sanitize_protocol_name(receiver_name);
@@ -241,7 +242,7 @@ impl MiPlayAdvertisement {
             retired_mi_connect_instances.sort();
             retired_mi_connect_instances.dedup();
             retired_mi_connect_instances.retain(|retired| retired != &mi_connect_instance);
-            let retired_mi_connect_goodbyes = retired_mi_connect_instances
+            let mut retired_mi_connect_goodbyes: Vec<Vec<u8>> = retired_mi_connect_instances
                 .into_iter()
                 .filter_map(|retired_instance| {
                     zero_dns_record_ttls(&build_mi_connect_response(
@@ -255,6 +256,40 @@ impl MiPlayAdvertisement {
                     ))
                 })
                 .collect();
+            // Explicit names remembered by the host. Renaming the receiver
+            // changes the Mi-Connect DNS instance label (it embeds the display
+            // name), while Xiaomi device centers may keep the old route in
+            // their cache. Emit targeted goodbyes for every retired name so a
+            // rename does not surface as a second receiver.
+            let mut retired_names: Vec<&String> = retired_receiver_names
+                .iter()
+                .filter(|name| name.as_str() != receiver_name && !name.trim().is_empty())
+                .collect();
+            retired_names.sort();
+            retired_names.dedup();
+            for retired_name in &retired_names {
+                let retired_instance = legacy_mi_connect_instance(retired_name, idm_instance_id);
+                if retired_instance == mi_connect_instance {
+                    continue;
+                }
+                if let Some(goodbye) = zero_dns_record_ttls(&build_mi_connect_response(
+                    retired_name,
+                    &retired_instance,
+                    idm_instance_id,
+                    media_device_id,
+                    device_type,
+                    local_ip,
+                    mi_connect_ipv6,
+                )) {
+                    retired_mi_connect_goodbyes.push(goodbye);
+                }
+            }
+            events(json!({
+                "event": "discovery_retired_routes",
+                "protocol": "xiaomi_miplay",
+                "retired_receiver_names": retired_names,
+                "goodbye_count": retired_mi_connect_goodbyes.len(),
+            }));
             let responses = Arc::new(DiscoveryResponses {
                 lyra: build_lyra_response(
                     receiver_name,
@@ -2856,5 +2891,24 @@ mod tests {
             offset += 10 + data_length;
         }
         assert_eq!(offset, rewritten.len());
+    }
+}
+
+#[cfg(test)]
+mod rename_route_tests {
+    use super::*;
+
+    #[test]
+    fn renaming_creates_a_distinct_mi_connect_instance() {
+        let idm = "c448243f-754a-4af4-868c-193906f981c8";
+        let old = legacy_mi_connect_instance("FusionPlay", idm);
+        let new = legacy_mi_connect_instance("书房电视", idm);
+        assert_ne!(old, new, "rename must be tracked for goodbye cleanup");
+        assert!(old.contains("FusionPlay"));
+        assert_eq!(
+            legacy_mi_connect_instance("FusionPlay", idm),
+            old,
+            "the idm suffix stays stable across runs"
+        );
     }
 }

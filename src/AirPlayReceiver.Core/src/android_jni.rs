@@ -312,6 +312,34 @@ fn list_network_adapters_json() -> Result<Value> {
     }))
 }
 
+/// Remember receiver display names and return the previous ones (for MiPlay
+/// route cleanup). Mi-Connect's DNS instance label embeds the display name;
+/// a rename therefore creates a new label while Xiaomi device centers may keep
+/// the old route cached. The SDK sends goodbyes for these retired names.
+fn receiver_name_history(directory: &Path, current: &str) -> Vec<String> {
+    let path = directory.join("miplay-receiver-names.json");
+    let mut names: Vec<String> = fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default();
+    let retired: Vec<String> = names
+        .iter()
+        .filter(|name| name.as_str() != current && !name.trim().is_empty())
+        .cloned()
+        .collect();
+    if !names.iter().any(|name| name == current) {
+        names.push(current.to_owned());
+    }
+    if names.len() > 8 {
+        let drain = names.len() - 8;
+        names.drain(..drain);
+    }
+    if let Ok(text) = serde_json::to_string_pretty(&names) {
+        let _ = fs::write(&path, text);
+    }
+    retired
+}
+
 fn load_or_create_identity(directory: &Path) -> Result<ReceiverIdentity> {
     fs::create_dir_all(directory)?;
     let path = directory.join("miplay-identity-v1.json");
@@ -725,6 +753,7 @@ pub extern "system" fn Java_com_airplayreceiver_desktop_nativebridge_FusionPlayN
             return std::ptr::null_mut();
         }
     };
+    let retired_receiver_names = receiver_name_history(&identity_dir, &name);
     let interface_hardware_address = interface_hardware_address(&interface_name);
     let interface_eui64_hardware_address =
         interface_eui64_hardware_address(&interface_name, local_ip);
@@ -813,6 +842,7 @@ pub extern "system" fn Java_com_airplayreceiver_desktop_nativebridge_FusionPlayN
         .with_device_type(device_type)
         .with_output_device(output_device)
         .with_hardware_address(Some(active_identity.hardware_address.clone()))
+        .with_retired_receiver_names(retired_receiver_names)
         .with_initial_volume_percent(initial_volume_percent.clamp(0, 100) as u32);
     match MiPlayReceiver::start(config, events) {
         Ok(receiver) => {

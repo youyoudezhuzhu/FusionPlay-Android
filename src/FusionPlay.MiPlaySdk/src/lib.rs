@@ -167,6 +167,10 @@ pub struct ReceiverConfig {
     /// Enables local multicast delivery only for an explicit diagnostic
     /// probe. Production receivers keep this disabled to avoid self-traffic.
     pub diagnostic_multicast_loopback: bool,
+    /// Previous receiver display names. Their Mi-Connect DNS instances are sent
+    /// goodbye on start so a rename does not leave two routes cached by the
+    /// sender/device center.
+    pub retired_receiver_names: Vec<String>,
 }
 
 impl ReceiverConfig {
@@ -188,6 +192,7 @@ impl ReceiverConfig {
             output_device: None,
             initial_volume_percent: 50,
             diagnostic_multicast_loopback: false,
+            retired_receiver_names: Vec::new(),
         }
     }
 
@@ -214,6 +219,14 @@ impl ReceiverConfig {
 
     pub fn with_diagnostic_multicast_loopback(mut self, enabled: bool) -> Self {
         self.diagnostic_multicast_loopback = enabled;
+        self
+    }
+
+    /// Display names previously used by this receiver. Goodbyes are emitted
+    /// for their Mi-Connect routes on start, so renaming does not leave two
+    /// routes in a sender's cached device list.
+    pub fn with_retired_receiver_names(mut self, names: Vec<String>) -> Self {
+        self.retired_receiver_names = names;
         self
     }
 }
@@ -329,6 +342,7 @@ impl MiPlayReceiver {
             config.local_ip,
             &config.interface_name,
             config.diagnostic_multicast_loopback,
+            &config.retired_receiver_names,
             Arc::clone(&events),
         ) {
             Ok(advertisement) => advertisement,

@@ -74,3 +74,7 @@ FusionPlay 原创源码使用 [GNU Affero General Public License v3.0](LICENSE)�
 ## Android Release 签名
 
 发布 APK 使用固定 release keystore，保证后续版本可覆盖安装；详见 [docs/ANDROID_RELEASE_SIGNING.md](docs/ANDROID_RELEASE_SIGNING.md)。
+
+## 妙播改名后的旧路由
+
+改名后若电视/设备中心仍显示两个实例，见 [docs/MIPLAY_DUPLICATE_ROUTES.md](docs/MIPLAY_DUPLICATE_ROUTES.md)（1.2.8/0.2.5 起自动清理历史名称路由）。

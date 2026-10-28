@@ -406,6 +406,7 @@ impl ProtocolHosts {
 
         let (interface, ip, mac) = pick_interface(&config.receiver.interface)?;
         let identity = load_identity(state_dir)?;
+        let retired_names = receiver_name_history(state_dir, &config.receiver.name);
         let state = Arc::clone(&self.state);
         let sink = Arc::clone(&self.sink);
         let events: EventEmitter = Arc::new(move |value: Value| {
@@ -421,6 +422,7 @@ impl ProtocolHosts {
             interface,
         )
         .with_device_type(miplay_device_type(&config.protocols.miplay.device_type))
+        .with_retired_receiver_names(retired_names)
         .with_initial_volume_percent(50)
         .with_hardware_address(Some(mac));
         // `MiPlayReceiver::start()` emits `receiver_ready` synchronously *before*
@@ -522,6 +524,32 @@ fn pick_interface(requested: &str) -> Result<(String, std::net::Ipv4Addr, String
         .map(|value| value.trim().to_string())
         .unwrap_or_default();
     Ok((name, ip, mac))
+}
+
+/// Persist receiver display names and return previous ones for MiPlay route
+/// cleanup (renaming changes the Mi-Connect DNS instance label).
+fn receiver_name_history(state_dir: &Path, current: &str) -> Vec<String> {
+    let path = state_dir.join("miplay-receiver-names.json");
+    let mut names: Vec<String> = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default();
+    let retired: Vec<String> = names
+        .iter()
+        .filter(|name| name.as_str() != current && !name.trim().is_empty())
+        .cloned()
+        .collect();
+    if !names.iter().any(|name| name == current) {
+        names.push(current.to_owned());
+    }
+    if names.len() > 8 {
+        let drain = names.len() - 8;
+        names.drain(..drain);
+    }
+    if let Ok(text) = serde_json::to_string_pretty(&names) {
+        let _ = std::fs::write(&path, text);
+    }
+    retired
 }
 
 fn load_identity(state_dir: &Path) -> Result<ReceiverIdentity> {
@@ -794,7 +822,11 @@ fn handle_miplay_event(value: Value, state: SharedState, sink: Arc<EngineSink>) 
                 tracing::warn!("miplay: {message}");
             }
         }
-        _ => {}
+        other => {
+            // Keep discovery/transport event names visible at debug level; they
+            // are essential when diagnosing duplicate or missing receivers.
+            tracing::debug!("miplay event: {other}");
+        }
     }
 }
 
