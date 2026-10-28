@@ -239,12 +239,15 @@ window.FP = window.FP || {};
       u.clearNode(list);
       let enabledCount = 0;
       let errorCount = 0;
+      const draft = store.getDraft();
+      const miplayType = draft && draft.protocols && draft.protocols.miplay
+        ? draft.protocols.miplay.device_type : '';
       FP.PROTOCOLS.forEach(function (meta) {
         const runtime = protocols[meta.key] || null;
         const item = u.create('li');
         const nameWrap = u.create('div', 'protocol-mini-name');
         const iconWrap = u.create('span', 'device-icon');
-        iconWrap.appendChild(u.svgIcon(meta.icon));
+        iconWrap.appendChild(u.svgIcon(meta.key === 'miplay' ? u.miplayDeviceIcon(miplayType) : meta.icon));
         nameWrap.appendChild(iconWrap);
         const textWrap = u.create('div');
         textWrap.appendChild(u.create('div', null, meta.label));

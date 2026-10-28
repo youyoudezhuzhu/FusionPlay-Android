@@ -245,6 +245,10 @@ window.FP = window.FP || {};
       markPlain('protocols.' + key + '.enabled', !!enabled);
     }
 
+    function setMiplayDeviceType(value) {
+      markPlain('protocols.miplay.device_type', String(value || 'television'));
+    }
+
     function setGlobal(field, value) {
       markPlain('audio.' + field, value);
     }
@@ -373,6 +377,7 @@ window.FP = window.FP || {};
       adoptConfig: adoptConfig,
       setReceiverField: setReceiverField,
       setProtocolEnabled: setProtocolEnabled,
+      setMiplayDeviceType: setMiplayDeviceType,
       setGlobal: setGlobal,
       setDeviceField: setDeviceField,
       addDevice: addDevice,

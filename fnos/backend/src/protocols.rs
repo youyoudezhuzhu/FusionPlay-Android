@@ -23,8 +23,8 @@ use fusionplay_core::{
     run_receiver_with_arbiter,
 };
 use fusionplay_miplay_sdk::{
-    EventEmitter, MiPlayPcmOutput, MiPlayReceiver, ReceiverConfig, ReceiverIdentity,
-    ReceiverController,
+    EventEmitter, MiPlayDeviceType, MiPlayPcmOutput, MiPlayReceiver, ReceiverConfig,
+    ReceiverIdentity, ReceiverController,
 };
 
 use crate::audio::AudioEngine;
@@ -49,6 +49,17 @@ mod proto_state {
 fn set_proto(runtime: &mut ProtocolRuntime, state: &str, detail: impl Into<String>) {
     runtime.state = state.to_string();
     runtime.detail = detail.into();
+}
+
+/// Map the persisted device identity to the SDK enum. `display_speaker` is an
+/// Android legacy alias and maps to Speaker, matching the upstream app.
+fn miplay_device_type(value: &str) -> MiPlayDeviceType {
+    match value {
+        "vehicle" => MiPlayDeviceType::Vehicle,
+        "tablet" => MiPlayDeviceType::Tablet,
+        "speaker" | "display_speaker" => MiPlayDeviceType::Speaker,
+        _ => MiPlayDeviceType::Television,
+    }
 }
 
 /// Map a core lifecycle status to the canonical AirPlay state.
@@ -262,6 +273,7 @@ impl ProtocolHosts {
             "airplay": config.protocols.airplay.enabled,
             "dlna": config.protocols.dlna.enabled,
             "miplay": config.protocols.miplay.enabled,
+            "miplay_device_type": config.protocols.miplay.device_type,
         })
         .to_string()
     }
@@ -376,6 +388,7 @@ impl ProtocolHosts {
     }
 
     fn start_miplay(&self, config: &Config, state_dir: &Path) -> Result<()> {
+
         let (interface, ip, mac) = pick_interface(&config.receiver.interface)?;
         let identity = load_identity(state_dir)?;
         let state = Arc::clone(&self.state);
@@ -392,6 +405,7 @@ impl ProtocolHosts {
             ip,
             interface,
         )
+        .with_device_type(miplay_device_type(&config.protocols.miplay.device_type))
         .with_initial_volume_percent(50)
         .with_hardware_address(Some(mac));
         // `MiPlayReceiver::start()` emits `receiver_ready` synchronously *before*
@@ -892,6 +906,16 @@ mod tests {
         let runtime = state.snapshot();
         assert_eq!(runtime.miplay.state, "waiting");
         assert_eq!(runtime.miplay.detail, "等待小米妙播投放");
+    }
+
+    #[test]
+    fn miplay_device_identity_maps_like_android() {
+        assert_eq!(miplay_device_type("vehicle"), MiPlayDeviceType::Vehicle);
+        assert_eq!(miplay_device_type("television"), MiPlayDeviceType::Television);
+        assert_eq!(miplay_device_type("tablet"), MiPlayDeviceType::Tablet);
+        assert_eq!(miplay_device_type("speaker"), MiPlayDeviceType::Speaker);
+        assert_eq!(miplay_device_type("display_speaker"), MiPlayDeviceType::Speaker);
+        assert_eq!(miplay_device_type("unknown"), MiPlayDeviceType::Television);
     }
 
     #[test]

@@ -68,7 +68,7 @@ impl Default for ReceiverSettings {
 pub struct ProtocolSettings {
     pub airplay: ProtocolSwitch,
     pub dlna: ProtocolSwitch,
-    pub miplay: ProtocolSwitch,
+    pub miplay: MiPlaySwitch,
 }
 
 impl Default for ProtocolSettings {
@@ -76,7 +76,7 @@ impl Default for ProtocolSettings {
         Self {
             airplay: ProtocolSwitch { enabled: true },
             dlna: ProtocolSwitch { enabled: true },
-            miplay: ProtocolSwitch { enabled: true },
+            miplay: MiPlaySwitch::default(),
         }
     }
 }
@@ -90,6 +90,31 @@ pub struct ProtocolSwitch {
 impl Default for ProtocolSwitch {
     fn default() -> Self {
         Self { enabled: true }
+    }
+}
+
+/// MiPlay exposes the receiver to HyperOS senders as a specific device category.
+/// The Android app lets the user switch this identity (车机/电视/平板/音响);
+/// fnOS mirrors the same four values so the sender UI shows the matching icon.
+pub const MIPLAY_DEVICE_TYPES: &[&str] = &["vehicle", "television", "tablet", "speaker", "display_speaker"];
+
+pub fn default_miplay_device_type() -> String {
+    "television".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MiPlaySwitch {
+    pub enabled: bool,
+    /// `vehicle | television | tablet | speaker` (`display_speaker` is accepted
+    /// as a legacy alias of `speaker`, matching the Android app).
+    #[serde(default = "default_miplay_device_type")]
+    pub device_type: String,
+}
+
+impl Default for MiPlaySwitch {
+    fn default() -> Self {
+        Self { enabled: true, device_type: default_miplay_device_type() }
     }
 }
 
@@ -238,6 +263,12 @@ impl Config {
         }
         if self.audio.sample_rate != 44_100 && self.audio.sample_rate != 48_000 {
             anyhow::bail!("音源采样率仅支持 44100/48000");
+        }
+        if !MIPLAY_DEVICE_TYPES.contains(&self.protocols.miplay.device_type.as_str()) {
+            anyhow::bail!(
+                "小米妙播设备类型不合法：{}（可选：车机 vehicle / 电视 television / 平板 tablet / 音响 speaker）",
+                self.protocols.miplay.device_type
+            );
         }
         if !(0.0..=100.0).contains(&self.audio.global_attenuation_percent) {
             anyhow::bail!("全局衰减必须在 0–100%");
@@ -418,6 +449,28 @@ mod tests {
         assert!(cfg.validate().is_err(), "positive device gain must be rejected");
         cfg.audio.devices[0].gain_db = 0.0;
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn miplay_device_type_defaults_and_roundtrips() {
+        // Old configs without the field (or without protocols.miplay at all)
+        // keep the Android default identity: television.
+        let old: Config = serde_json::from_str(r#"{"protocols":{"miplay":{"enabled":true}}}"#).unwrap();
+        assert_eq!(old.protocols.miplay.device_type, "television");
+        assert!(old.protocols.miplay.enabled);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let mut cfg = Config::default();
+        cfg.protocols.miplay.device_type = "vehicle".into();
+        cfg.save(&path).unwrap();
+        let loaded = Config::load(&path).unwrap();
+        assert_eq!(loaded.protocols.miplay.device_type, "vehicle");
+
+        cfg.protocols.miplay.device_type = "toaster".into();
+        assert!(cfg.validate().is_err(), "unknown identity must be rejected");
+        cfg.protocols.miplay.device_type = "display_speaker".into();
+        assert!(cfg.validate().is_ok(), "Android legacy alias is accepted");
     }
 
     #[test]

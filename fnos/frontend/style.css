@@ -1107,3 +1107,18 @@ body.has-savebar .toast { bottom: 92px; }
     scroll-behavior: auto !important;
   }
 }
+
+/* MiPlay sender-visible device identity (车机/电视/平板/音响) */
+.identity-row { margin-top: 10px; display: flex; flex-direction: column; gap: 7px; }
+.identity-grid { display: flex; flex-wrap: wrap; gap: 6px; }
+.identity-option {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 7px 10px; border: 1px solid var(--border);
+  border-radius: var(--radius-btn); background: var(--surface-2);
+  color: var(--text); font: inherit; font-size: 12px; cursor: pointer;
+}
+.identity-option .icon { width: 16px; height: 16px; color: var(--muted); }
+.identity-option:hover { border-color: var(--accent); }
+.identity-option.active { border-color: var(--accent); background: var(--accent-soft); color: var(--accent); }
+.identity-option.active .icon { color: var(--accent); }
+.identity-option:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }

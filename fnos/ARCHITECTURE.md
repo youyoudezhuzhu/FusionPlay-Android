@@ -80,7 +80,7 @@ pub use events::{CoreEvent, EventSink};
 | 文件 | 职责 |
 |---|---|
 | `src/main.rs` | 解析 `--config/--state-dir/--listen-tcp/--listen-unix/--version`；初始化日志；起 AudioEngine、协议宿主、HTTP；SIGTERM 收尾 |
-| `src/config.rs` | `Config { config_version, receiver, protocols{airplay,dlna,miplay}, audio{global_attenuation_percent, muted, devices[{id,name,enabled,gain_db,delay_ms,sample_rate,curve}], legacy curve}, logging }`；原子落盘、导入导出、v1→v2 幂等迁移、默认值 |
+| `src/config.rs` | `Config { config_version, receiver, protocols{airplay,dlna,miplay{enabled,device_type}}, audio{global_attenuation_percent, muted, devices[{id,name,enabled,gain_db,delay_ms,sample_rate,curve}], legacy curve}, logging }`；原子落盘、导入导出、v1→v2 幂等迁移、默认值 |
 | `src/state.rs` | 共享状态快照（`Arc<RwLock<AppState>>`）：协议状态、当前音源/媒体、发送端音量、设备状态、队列/丢帧、错误 |
 | `src/session.rs` | 三协议仲裁：`Lease { source, epoch }`；`claim()` 接管并回调旧源 suspend；只放行当前 lease 的 PCM |
 | `src/volume.rs` | `Curve::{Linear,Soft,Balanced,Custom}`、单调自定义点、逐设备曲线映射 `sender_logical -> amplitude`、`device_db_to_gain`、`delay_ms_to_frames`；测试 |
@@ -128,7 +128,14 @@ device_gain = device.curve.apply(sender_gain)      // 该设备自己的响应�
 - 旧配置的 `audio.curve`（v1 全局曲线）在加载时复制给所有尚无独立曲线的设备，
   然后清空并写回 `config_version=2`；迁移幂等，且不会覆盖已存在独立曲线的设备。
 
-### 3.3 协议运行状态词表（三协议 + 两个页面共用）
+### 3.3 MiPlay 设备身份
+
+`protocols.miplay.device_type`（默认 `television`）决定妙播发送端看到的设备类别与图标：
+`vehicle` 车机 / `television` 电视 / `tablet` 平板 / `speaker` 音响（`display_speaker` 作为 Android
+旧别名映射为 `speaker`）。该字段进入协议宿主重启指纹，修改后保存会重新广播；发送端侧图标
+（车机/电视/平板/音响）随之变化。Android 与 fnOS 使用同一组取值。
+
+### 3.4 协议运行状态词表（三协议 + 两个页面共用）
 
 后端只输出以下规范状态，`/api/status.protocols.*.state` 与 Web UI 的概览/接收页共用同一词表，
 不允许再出现 `ready/listening/running` 三套同义状态：

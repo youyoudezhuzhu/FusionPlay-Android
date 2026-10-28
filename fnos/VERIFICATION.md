@@ -302,3 +302,34 @@ GitHub Actions（tag `fnos-v0.2.2` → commit `ae81ef1`）：
   `BUILD-INFO: version=0.2.2 commit=ae81ef1 built=2026-10-28T06:08:18Z`。
 - Release：<https://github.com/youyoudezhuzhu/FusionPlay-Android/releases/tag/fnos-v0.2.2>。
 - 工作区副本：`artifacts/FusionPlay-fnos-0.2.2-x86.fpk`。
+
+---
+
+## 11. v0.2.3：恢复小米妙播设备身份切换（车机/电视/平板/音响）
+
+### 11.1 背景
+
+Android 版设置页可选择妙播设备身份（`vehicle` 车机 / `television` 电视 / `tablet` 平板 /
+`speaker` 音响），发送端会显示对应图标；fnOS 版此前遗漏了该配置。
+
+### 11.2 实现
+
+- 后端配置：`protocols.miplay.device_type`，默认 `television`；接受 Android 旧别名
+  `display_speaker`（映射为 `speaker`）；非法值在 `validate()` 拒绝。
+- 后端启动：`MiPlayReceiver` 通过 `ReceiverConfig::with_device_type(...)` 应用身份；
+  该字段纳入协议宿主重启指纹，修改后保存即重新广播。
+- 前端「接收」页妙播行新增四个图标按钮「车机 / 电视 / 平板 / 音响」：
+  图标取自 Android 同款 SVG（内联 sprite），选中态高亮；修改进入统一草稿/保存栏，
+  保存后回读确认并等待协议宿主重启；接收页行图标与概览协议卡图标同步显示当前身份。
+- 兼容：旧配置无该字段 → 默认电视；不影响 AirPlay/DLNA/音频校准与 Android 代码。
+
+### 11.3 验证
+
+- 后端：`--all-targets` **61 passed / 0 failed / 1 ignored**（lib 38 + mock 7 + dlna 11 + http 4），
+  新增：设备身份映射（vehicle/television/tablet/speaker/display_speaker/未知→电视）、
+  配置默认值/往返/非法值拒绝、旧配置无字段兼容。
+- 前端：静态检查 OK、真实后端 API **72/72**、jsdom DOM **74/74**、曲线逻辑 **18/18**。
+- 设备身份 jsdom 端到端（真实后端 + 网关路径）**14/14**：
+  默认电视、四个选项、点击车机出现保存栏、保存后 `GET /api/config` 为 `vehicle`、
+  妙播重启为 `waiting`、接收页与概览图标切为 `#icon-device-vehicle`、服务端持久化、无运行错误。
+- FPK `0.2.3` 构建 + check-fpk 通过；`simulate-install` **63/63**、`simulate-upgrade` **46/46**。

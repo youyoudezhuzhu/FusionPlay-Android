@@ -40,6 +40,33 @@ window.FP = window.FP || {};
         main.appendChild(titleLine);
         main.appendChild(u.create('p', 'protocol-desc', meta.desc));
 
+        // MiPlay exposes a sender-visible device identity (车机/电视/平板/音响).
+        // It mirrors the Android app and changes the icon the sender shows.
+        let identityButtons = null;
+        if (meta.key === 'miplay') {
+          const identity = u.create('div', 'identity-row');
+          identity.appendChild(u.create('span', 'sub-label', '设备类型'));
+          const grid = u.create('div', 'identity-grid');
+          grid.setAttribute('role', 'radiogroup');
+          grid.setAttribute('aria-label', '小米妙播设备类型');
+          identityButtons = FP.MIPLAY_DEVICE_TYPES.map(function (item) {
+            const button = u.create('button', 'identity-option');
+            button.type = 'button';
+            button.dataset.type = item.value;
+            button.setAttribute('role', 'radio');
+            button.setAttribute('aria-checked', 'false');
+            button.setAttribute('aria-label', '以' + item.label + '身份广播');
+            button.appendChild(u.svgIcon(item.icon, 'identity-icon'));
+            button.appendChild(u.create('span', null, item.label));
+            grid.appendChild(button);
+            return button;
+          });
+          identity.appendChild(grid);
+          main.appendChild(identity);
+          main.appendChild(u.create('p', 'hint',
+            '切换后保存并应用，接收器会以新的设备身份重新广播（发送端图标随之变化）。'));
+        }
+
         const toggle = u.create('button', 'switch');
         toggle.type = 'button';
         toggle.setAttribute('role', 'switch');
@@ -61,7 +88,10 @@ window.FP = window.FP || {};
         item.appendChild(toggle);
         item.appendChild(details);
         list.appendChild(item);
-        refs.set(meta.key, { item: item, statePill: statePill, pending: pending, toggle: toggle, kv: kv });
+        refs.set(meta.key, {
+          item: item, statePill: statePill, pending: pending, toggle: toggle, kv: kv,
+          iconWrap: iconWrap, identityButtons: identityButtons
+        });
       });
     }
 
@@ -134,6 +164,20 @@ window.FP = window.FP || {};
         ref.pending.hidden = !pending;
         if (pending) pendingCount += 1;
 
+        if (meta.key === 'miplay') {
+          const selected = u.miplayDeviceType(draftProtocols.miplay && draftProtocols.miplay.device_type);
+          if (ref.identityButtons) {
+            ref.identityButtons.forEach(function (button) {
+              const on = button.dataset.type === selected.value;
+              button.classList.toggle('active', on);
+              button.setAttribute('aria-checked', on ? 'true' : 'false');
+            });
+          }
+          if (ref.iconWrap) {
+            u.clearNode(ref.iconWrap);
+            ref.iconWrap.appendChild(u.svgIcon(selected.icon));
+          }
+        }
         u.setSwitch(ref.toggle, draftEnabled);
         ref.toggle.setAttribute('aria-label', (draftEnabled ? '停用 ' : '启用 ') + meta.label);
         const rows = [
@@ -202,6 +246,15 @@ window.FP = window.FP || {};
       });
 
       el('receive-protocols').addEventListener('click', function (event) {
+        const identityOption = event.target.closest('.identity-option');
+        if (identityOption) {
+          const identityItem = identityOption.closest('[data-protocol]');
+          if (identityItem && identityItem.dataset.protocol === 'miplay') {
+            store.setMiplayDeviceType(identityOption.dataset.type);
+            renderProtocols();
+          }
+          return;
+        }
         const toggle = event.target.closest('.switch');
         if (!toggle) return;
         const item = toggle.closest('[data-protocol]');

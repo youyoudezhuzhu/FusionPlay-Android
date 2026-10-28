@@ -306,6 +306,14 @@ window.FP = window.FP || {};
     error: '异常', failed: '异常'
   };
 
+  // MiPlay device identities, mirroring the Android app (车机/电视/平板/音响).
+  const MIPLAY_DEVICE_TYPES = [
+    { value: 'vehicle', label: '车机', icon: 'device-vehicle' },
+    { value: 'television', label: '电视', icon: 'device-television' },
+    { value: 'tablet', label: '平板', icon: 'device-tablet' },
+    { value: 'speaker', label: '音响', icon: 'device-speaker' }
+  ];
+
   const CURVE_LABELS = { linear: '线性', soft: '柔和', balanced: '均衡', custom: '自定义' };
   const LOG_LEVEL_LABELS = { error: 'error', warn: 'warn', info: 'info', debug: 'debug', trace: 'trace' };
 
@@ -328,6 +336,21 @@ window.FP = window.FP || {};
       case 'error': case 'failed': return 'danger';
       default: return 'neutral';
     }
+  }
+
+  function miplayDeviceType(value) {
+    const normalized = String(value || '').trim().toLowerCase();
+    if (normalized === 'display_speaker') return MIPLAY_DEVICE_TYPES[3];
+    return MIPLAY_DEVICE_TYPES.find(function (item) { return item.value === normalized; }) ||
+      MIPLAY_DEVICE_TYPES[1];
+  }
+
+  function miplayDeviceIcon(value) {
+    return miplayDeviceType(value).icon;
+  }
+
+  function miplayDeviceLabel(value) {
+    return miplayDeviceType(value).label;
   }
 
   function curveKindLabel(kind) {
@@ -421,6 +444,7 @@ window.FP = window.FP || {};
 
   FP.GATEWAY_BASE = GATEWAY_BASE;
   FP.PROTOCOLS = PROTOCOLS;
+  FP.MIPLAY_DEVICE_TYPES = MIPLAY_DEVICE_TYPES;
   FP.apiUrl = apiUrl;
   FP.api = api;
   FP.util = {
@@ -431,6 +455,8 @@ window.FP = window.FP || {};
     fmtUptime: fmtUptime, fmtPosition: fmtPosition, fmtRate: fmtRate, fmtDb: fmtDb,
     fmtMs: fmtMs, fmtPpm: fmtPpm, fmtCount: fmtCount, fmtPercent: fmtPercent,
     fmtChannels: fmtChannels, timestampForFile: timestampForFile,
+    miplayDeviceType: miplayDeviceType, miplayDeviceIcon: miplayDeviceIcon,
+    miplayDeviceLabel: miplayDeviceLabel,
     syncRange: syncRange, setRange: setRange, setInput: setInput, setSelect: setSelect,
     setSwitch: setSwitch, downloadText: downloadText, copyText: copyText,
     protocolMeta: protocolMeta, stateLabel: stateLabel, stateTone: stateTone,

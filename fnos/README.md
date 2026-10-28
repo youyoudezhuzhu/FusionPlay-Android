@@ -6,7 +6,7 @@
 | 项目 | 值 |
 |---|---|
 | 应用标识（appname） | `fusionplay-fnos` |
-| 当前版本 | `0.2.2`（x86_64） |
+| 当前版本 | `0.2.3`（x86_64） |
 | 安装包 | `fusionplay-fnos.fpk`（GitHub Actions artifact / Release 附件） |
 | 服务端口 | `18080`（仅绑定 `127.0.0.1`，供本机诊断；对外走 fnOS 统一网关） |
 | 运行身份 | `run-as: package` + `join-groups: ["audio"]`（**非 root**） |
