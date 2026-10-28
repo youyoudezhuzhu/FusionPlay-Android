@@ -91,6 +91,23 @@ errors = []
 | `./fnos/tools/simulate-upgrade.sh` | ✅ 46/46 断言：正常升级（upgrade_init 停旧+清端口，upgrade_callback 起新，/healthz 报新版本 0.1.1，/proc/pid/exe 哈希=新二进制，配置/HOME 保留，仅 1 进程）＋ 无 PID 文件孤儿进程升级清理 |
 | FPK 体积 | 3.7 MB（含 x86_64 单二进制 + 静态 UI + 许可证） |
 
+## 6.1 GitHub Actions 云端构建（真实执行）
+
+- 工作流：`.github/workflows/build-fnos.yml`（未改动 `android.yml`）
+- 触发：push tag `fnos-v0.1.0` → run
+  [40621295962](https://github.com/youyoudezhuzhu/FusionPlay-Android/actions/runs/40621295962)
+  **全部步骤 success**：backend 45 tests / core 82+1 tests / MiPlay 93 tests →
+  release 构建 → FPK 打包 → check-fpk（86 项）→ simulate-install（63）→
+  simulate-upgrade（46）→ artifact 上传 → Release 附件。
+- 构建产物（CI artifact 下载后本地复验）：
+  - `fusionplay-fnos.fpk`，3,804,398 B，sha256 `e5c9b177a2c918a79c08f5038d12e9e85490f5307f43ea432de1a89325e79e44`
+  - 解包 `BUILD-INFO`：`version=0.1.0 commit=adf8700 built=2026-10-28T02:34:02Z`
+  - 本地 `fnos/dist/fusionplay-fnos.fpk`：sha256 `2884b20b…`（同源码不同构建时间戳，结构/版本一致，check-fpk 均通过）
+- GitHub Release：`fnos-v0.1.0` 已附带 `fusionplay-fnos.fpk`
+  <https://github.com/youyoudezhuzhu/FusionPlay-Android/releases/tag/fnos-v0.1.0>
+- 说明：GitHub 的 `workflow_dispatch` 仅对默认分支上的工作流显示入口；本工作流已在
+  tag push 场景真实跑通，合并 `fnos/fpk` 到默认分支后即可在 Actions 页面手动触发（支持指定 ref/分支）。
+
 ## 7. 未验证项（必须真机，不得宣称已完成）
 
 1. iPhone/iPad/macOS 真实 AirPlay 2 投放：播放/暂停/切歌/发送端音量/断线重连。
