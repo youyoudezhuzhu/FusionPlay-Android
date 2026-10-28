@@ -290,3 +290,15 @@ miplay  state='waiting'  detail='等待小米妙播投放'
 - FPK `0.2.2` 构建与 check-fpk 通过；`simulate-install` **63/63**、
   `simulate-upgrade` **46/46**。
 - 已安装实例（0.2.1）当前仍显示启动中，升级到 0.2.2 后即可恢复「等待投放」。
+
+### 10.5 CI 与产物
+
+GitHub Actions（tag `fnos-v0.2.2` → commit `ae81ef1`）：
+[run 40641665412](https://github.com/youyoudezhuzhu/FusionPlay-Android/actions/runs/40641665412)
+全步骤 success。
+
+- CI artifact（本地复验通过）：`fusionplay-fnos.fpk`，3,839,087 B，
+  sha256 `938a552ba74de8651d83cff02b77cb73c7c0a24136d9243998d7be6c2f67c184`，
+  `BUILD-INFO: version=0.2.2 commit=ae81ef1 built=2026-10-28T06:08:18Z`。
+- Release：<https://github.com/youyoudezhuzhu/FusionPlay-Android/releases/tag/fnos-v0.2.2>。
+- 工作区副本：`artifacts/FusionPlay-fnos-0.2.2-x86.fpk`。
