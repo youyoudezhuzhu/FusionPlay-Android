@@ -49,8 +49,25 @@ jobs:
       - name: Export CARGO_HOME
         run: echo "CARGO_HOME=$HOME/.cargo" >> "$GITHUB_ENV"
 
+      - name: Restore Android release signing key
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          KEY_PATH="$RUNNER_TEMP/fusionplay-release.jks"
+          if [ -z "$ANDROID_KEYSTORE_BASE64" ]; then
+            echo "::warning::ANDROID_KEYSTORE_BASE64 is not configured; the APK will be debug-signed and NOT upgradeable over release builds."
+            exit 0
+          fi
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 -d > "$KEY_PATH"
+          echo "ANDROID_KEYSTORE_PATH=$KEY_PATH" >> "$GITHUB_ENV"
+
       - name: Build universal APK
         working-directory: flutter
+        env:
+          ANDROID_KEYSTORE_PATH: ${{ runner.temp }}/fusionplay-release.jks
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
           VERSION="$(tr -d '[:space:]' < ../VERSION)"
           CODE="$(echo "$VERSION" | awk -F. '{print $1*10000+$2*100+$3}')"
@@ -65,6 +82,27 @@ jobs:
             --split-debug-info=build/symbols
           mkdir -p ../artifacts/releases
           cp build/app/outputs/flutter-apk/app-release.apk "../artifacts/releases/FusionPlay-Android-$VERSION.apk"
+
+      - name: Verify APK signing certificate
+        working-directory: flutter
+        env:
+          EXPECTED_CERT: ${{ secrets.ANDROID_CERT_SHA256 }}
+        run: |
+          APK="$(ls ../artifacts/releases/*.apk | head -1)"
+          APKSIGNER="${ANDROID_HOME:-$ANDROID_SDK_ROOT}/build-tools/36.0.0/apksigner"
+          "$APKSIGNER" verify --print-certs "$APK" > /tmp/apk-certs.txt
+          CERT="$(grep -m1 'SHA-256 digest' /tmp/apk-certs.txt | awk -F': ' '{print $2}' | tr -d ':' | tr 'a-f' 'A-F')"
+          echo "APK signer SHA-256: $CERT"
+          if [ -n "$EXPECTED_CERT" ]; then
+            WANT="$(printf '%s' "$EXPECTED_CERT" | tr -d ':' | tr 'a-f' 'A-F')"
+            if [ "$CERT" != "$WANT" ]; then
+              echo "::error::APK signing certificate mismatch: got $CERT, expected $WANT"
+              exit 1
+            fi
+            echo "Signing certificate matches the configured release key."
+          else
+            echo "::warning::ANDROID_CERT_SHA256 not configured; skipping certificate comparison."
+          fi
 
       - name: Upload APK
         uses: actions/upload-artifact@v4

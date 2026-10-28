@@ -70,3 +70,7 @@ Rust 模块可分别运行 `cargo test` 和 `cargo clippy`。Android 原生库�
 ## 许可证
 
 FusionPlay 原创源码使用 [GNU Affero General Public License v3.0](LICENSE)，SPDX 标识为 `AGPL-3.0-only`。项目内第三方组件继续适用各自许可证，详情见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) 与对应依赖源码或元数据。
+
+## Android Release 签名
+
+发布 APK 使用固定 release keystore，保证后续版本可覆盖安装；详见 [docs/ANDROID_RELEASE_SIGNING.md](docs/ANDROID_RELEASE_SIGNING.md)。

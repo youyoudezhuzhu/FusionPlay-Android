@@ -11,6 +11,14 @@ plugins {
 val repositoryRoot = layout.projectDirectory.dir("../../..")
 val generatedNativeLibs = layout.buildDirectory.dir("generated/fusionPlayJniLibs")
 
+// Stable release signing: CI (and maintainers) provide a fixed keystore through
+// environment variables so every release APK has the same certificate and can
+// be installed over the previous version. Without the variables (plain local
+// builds) we keep the historical debug-key fallback.
+val releaseKeystorePath: String? = System.getenv("ANDROID_KEYSTORE_PATH")
+val releaseKeystoreFile: java.io.File? =
+    releaseKeystorePath?.let { path -> java.io.File(path).takeIf { it.isFile } }
+
 android {
     namespace = "com.fusionplay.android"
     compileSdk = 36
@@ -33,11 +41,30 @@ android {
         }
     }
 
+    signingConfigs {
+        if (releaseKeystoreFile != null) {
+            create("release") {
+                storeFile = releaseKeystoreFile
+                storePassword = System.getenv("ANDROID_KEYSTORE_PASSWORD")
+                keyAlias = System.getenv("ANDROID_KEY_ALIAS")
+                keyPassword = System.getenv("ANDROID_KEY_PASSWORD")
+            }
+        }
+    }
+
     buildTypes {
         release {
-            // Local builds deliberately use the generated debug key. Distributors must
-            // replace this with a private release signing configuration of their own.
-            signingConfig = signingConfigs.getByName("debug")
+            // Stable release key when provided; otherwise keep the debug fallback
+            // for local development (those debug APKs are not upgradeable).
+            signingConfig = if (releaseKeystoreFile != null) {
+                signingConfigs.getByName("release")
+            } else {
+                project.logger.warn(
+                    "ANDROID_KEYSTORE_PATH is not set; release APK is signed with the debug key " +
+                        "and cannot be installed as an upgrade over a release-key build."
+                )
+                signingConfigs.getByName("debug")
+            }
             isMinifyEnabled = true
             isShrinkResources = true
             proguardFiles(
