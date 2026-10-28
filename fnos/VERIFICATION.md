@@ -99,10 +99,16 @@ errors = []
   **全部步骤 success**：backend 45 tests / core 82+1 tests / MiPlay 93 tests →
   release 构建 → FPK 打包 → check-fpk（86 项）→ simulate-install（63）→
   simulate-upgrade（46）→ artifact 上传 → Release 附件。
+- 最终构建（tag `fnos-v0.1.0` → commit `0f4984f`）：
+  [run 40622350237](https://github.com/youyoudezhuzhu/FusionPlay-Android/actions/runs/40622350237) **全步骤 success**。
 - 构建产物（CI artifact 下载后本地复验）：
-  - `fusionplay-fnos.fpk`，3,804,398 B，sha256 `e5c9b177a2c918a79c08f5038d12e9e85490f5307f43ea432de1a89325e79e44`
-  - 解包 `BUILD-INFO`：`version=0.1.0 commit=adf8700 built=2026-10-28T02:34:02Z`
-  - 本地 `fnos/dist/fusionplay-fnos.fpk`：sha256 `2884b20b…`（同源码不同构建时间戳，结构/版本一致，check-fpk 均通过）
+  - `fusionplay-fnos.fpk`，3,804,340 B，sha256 `6a721c23739a8a97a4c24d94835413cbdd7d4af8785050a7fbdeadbeb6974d8b`
+  - 解包 `BUILD-INFO`：`version=0.1.0 commit=0f4984f built=2026-10-28T02:42:36Z`
+  - 结构检查 `check-fpk.sh` 通过；本地 `fnos/dist/fusionplay-fnos.fpk` 已同步该产物。
+- Android 回归：同一 commit 上手动触发
+  [run 40622350101](https://github.com/youyoudezhuzhu/FusionPlay-Android/actions/runs/40622350101)
+  **build-apk success**——`start_audio_external` 再导出问题已修（`#[cfg(not(target_os = "android"))]`），
+  Android 路径与 APK 构建均未回归。
 - GitHub Release：`fnos-v0.1.0` 已附带 `fusionplay-fnos.fpk`
   <https://github.com/youyoudezhuzhu/FusionPlay-Android/releases/tag/fnos-v0.1.0>
 - 说明：GitHub 的 `workflow_dispatch` 仅对默认分支上的工作流显示入口；本工作流已在
