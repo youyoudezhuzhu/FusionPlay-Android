@@ -236,6 +236,18 @@ core 的 `status` 事件把 `ready` 原样写入 AirPlay 状态；MiPlay 启动�
   MiPlay 异常是因为该测试机 8899 端口被已安装实例占用；单实例下为「等待投放」）。
 - FPK：`0.2.1` 构建与 check-fpk 通过；`simulate-install` **63/63**、`simulate-upgrade` **46/46**。
 
-### 9.4 仍未验证
+### 9.4 CI 与产物
+
+GitHub Actions（tag `fnos-v0.2.1` → commit `5a7105c`）：
+[run 40640601613](https://github.com/youyoudezhuzhu/FusionPlay-Android/actions/runs/40640601613)
+全步骤 success（测试 → release 构建 → FPK → check-fpk → simulate-install 63 → simulate-upgrade 46 → artifact → Release）。
+
+- CI artifact（本地复验通过）：`fusionplay-fnos.fpk`，3,837,915 B，
+  sha256 `a2cca44dbe4bc8bb425a151c43b9bba89683014d8191fdcfbe4b08612df5b29a`，
+  `BUILD-INFO: version=0.2.1 commit=5a7105c built=2026-10-28T05:56:24Z`。
+- Release：<https://github.com/youyoudezhuzhu/FusionPlay-Android/releases/tag/fnos-v0.2.1>。
+- 工作区副本：`artifacts/FusionPlay-fnos-0.2.1-x86.fpk`。
+
+### 9.5 仍未验证
 
 与 §8.4 相同（真实浏览器截图、真实发送端、真实多声卡听感、应用中心安装）。
